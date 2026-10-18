@@ -2,6 +2,7 @@ import ast
 import unittest
 from pathlib import Path
 
+from src.domain.monitoring.roster import groups_for_sid
 from src.shared.utils.notify_session import is_sendable_group_session
 
 
@@ -24,7 +25,10 @@ def load_get_notify_sessions():
         if isinstance(node, ast.FunctionDef) and node.name == "_get_notify_sessions"
     )
     module = ast.Module(body=[method], type_ignores=[])
-    namespace = {"is_sendable_group_session": is_sendable_group_session}
+    namespace = {
+        "is_sendable_group_session": is_sendable_group_session,
+        "groups_for_sid": groups_for_sid,
+    }
     exec(compile(ast.fix_missing_locations(module), str(IMPLEMENTATION_PATH), "exec"), namespace)
     return namespace["_get_notify_sessions"]
 

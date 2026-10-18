@@ -32,8 +32,8 @@ class MonitorControlService:
         plugin.running_groups.discard(group_id)
         plugin._save_group_switches()
         plugin.next_poll_time.pop(group_id, None)
-        getattr(plugin, "_pending_end_notifications", {}).pop(group_id, None)
-        tasks = getattr(plugin, "achievement_poll_tasks", {})
+        plugin._pending_end_notifications.pop(group_id, None)
+        tasks = plugin.achievement_poll_tasks
         for key in [k for k in list(tasks.keys()) if k[0] == group_id]:
             task = tasks.pop(key, None)
             if task:
@@ -51,8 +51,6 @@ class MonitorControlService:
             return False
         plugin.group_monitor_enabled[group_id] = True
         plugin.running_groups.add(group_id)
-        if not hasattr(plugin, "notify_sessions"):
-            plugin.notify_sessions = {}
         if notify_session:
             plugin.notify_sessions[group_id] = notify_session
             plugin._save_notify_session()
@@ -61,6 +59,10 @@ class MonitorControlService:
         return True
 
     async def start(self, group_id: str, notify_session: Optional[str] = None) -> MonitorControlResult:
+        """启动本群监控：校验配置与名单，建立静默基线后加入轮询。
+
+        基线快照以 skip_push=True 投递，避免启动瞬间把历史状态当成新事件播报。
+        """
         plugin = self._plugin
         if not is_valid_group_id(group_id):
             return MonitorControlResult(False, "invalid_group", "请在群聊中使用该命令，私聊无法启动群监控。")
@@ -83,8 +85,6 @@ class MonitorControlService:
         if group_id in plugin.running_groups:
             return MonitorControlResult(False, "already_running", "本群Steam监控已在运行。")
         plugin.running_groups.add(group_id)
-        if not hasattr(plugin, "notify_sessions"):
-            plugin.notify_sessions = {}
         if notify_session:
             plugin.notify_sessions[group_id] = notify_session
             plugin._save_notify_session()

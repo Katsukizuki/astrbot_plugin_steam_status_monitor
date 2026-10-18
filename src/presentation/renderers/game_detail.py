@@ -1,15 +1,15 @@
 """Steam 游戏详情卡片渲染。"""
 
 import io
-import os
 import re
 from html import unescape
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 
 from ...shared.fonts import load_truetype
 from ...shared.network import httpx_client_kwargs
+from .drawing import wrap_text
 
 
 CARD_WIDTH = 820
@@ -78,28 +78,6 @@ def _plain_text(value):
     value = re.sub(r"<br\s*/?>", "\n", value or "", flags=re.I)
     value = re.sub(r"<[^>]+>", "", value or "")
     return re.sub(r"\s+", " ", unescape(value)).strip()
-
-
-def _wrap(draw, value, font, max_width, max_lines=None):
-    value = value or "暂无简介"
-    lines = []
-    current = ""
-    for char in value:
-        candidate = current + char
-        if current and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
-            lines.append(current)
-            current = char
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    if max_lines and len(lines) > max_lines:
-        lines = lines[:max_lines]
-        last = lines[-1]
-        while last and draw.textbbox((0, 0), last + "…", font=font)[2] > max_width:
-            last = last[:-1]
-        lines[-1] = (last or "暂无简介") + "…"
-    return lines or ["暂无简介"]
 
 
 def _currency_symbol(currency):
@@ -225,7 +203,7 @@ async def render_game_detail_image(
     cover_top = 22
     cover_height = max(1, round(right_width * cover.height / cover.width)) if cover else 220
     measure_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    description_lines = _wrap(measure_draw, description, body_font, right_width)
+    description_lines = wrap_text(measure_draw, description, body_font, right_width, empty_text="暂无简介")
     tag_rows = []
     tag_x = 0
     for tag in tags:

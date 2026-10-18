@@ -153,8 +153,7 @@ def test_list_maps_persona_state(monkeypatch, personastate, expected):
         return None
 
     monkeypatch.setattr("src.application.services.steam_list.render_steam_list_image", fake_render)
-    monkeypatch.setattr("src.application.services.steam_list.get_avatar_frame_path", fake_frame)
-    monkeypatch.setattr("src.application.services.steam_list.get_avatar_frame_url", fake_frame)
+    monkeypatch.setattr("src.application.services.steam_list.resolve_avatar_frame", fake_frame)
 
     class Event:
         def get_group_id(self):

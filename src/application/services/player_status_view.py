@@ -1,11 +1,12 @@
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from ...domain.monitoring.presence import persona_status
+from ...domain.monitoring.roster import direct_sids, push_sids
 from ...presentation.renderers.steam_list import get_status_text
+from ...shared.utils.duration import format_duration
 
 
-# 与 alllist 一致的 personastate -> 状态 映射（0离线,1在线,2忙碌,3离开,4打盹）
-_PERSONA_STATUS = {0: "offline", 1: "online", 2: "busy", 3: "away", 4: "snooze"}
 STATUS_SORT_RANK = {
     "playing": 0,
     "online": 1,
@@ -47,8 +48,7 @@ def build_player_row(sid, status, *, name, zh_game_name="", start_time=None, now
     avatar_url = status.get("avatarfull") or status.get("avatar") or ""
     if gameid:
         play_seconds = now - start_time if start_time else 0
-        play_minutes = play_seconds / 60
-        play_str = f"{play_minutes/60:.1f}小时" if play_minutes >= 60 else f"{play_minutes:.1f}分钟"
+        play_str = format_duration(play_seconds / 60)
         return {
             "sid": sid,
             "name": name,
@@ -64,7 +64,7 @@ def build_player_row(sid, status, *, name, zh_game_name="", start_time=None, now
         return {
             "sid": sid,
             "name": name,
-            "status": _PERSONA_STATUS.get(int(personastate), "online"),
+            "status": persona_status(personastate),
             "avatar_url": avatar_url,
             "game": "",
             "gameid": "",
@@ -131,14 +131,9 @@ class PlayerStatusViewService:
 
     def steam_ids_for_group(self, group_id: str) -> Tuple[List[str], List[str], List[str]]:
         plugin = self._plugin
-        direct = [str(sid) for sid in plugin.group_steam_ids.get(group_id, []) or []]
-        push = [
-            str(sid)
-            for sid, push_groups in (getattr(plugin, "push_groups", {}) or {}).items()
-            if group_id in {str(target) for target in push_groups}
-        ]
-        combined = list(dict.fromkeys([*direct, *push]))
-        return direct, push, combined
+        direct = direct_sids(plugin.group_steam_ids, group_id)
+        push = push_sids(plugin.push_groups, group_id)
+        return direct, push, list(dict.fromkeys([*direct, *push]))
 
     def primary_group_of(self, sid: str, fallback: str) -> str:
         sid = str(sid)

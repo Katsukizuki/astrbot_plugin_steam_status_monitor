@@ -2,7 +2,9 @@ from datetime import datetime, timedelta
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import time
 
+from ...domain.monitoring.roster import all_group_sids, sids_for_group
 from ...shared.logging import logger
+from ...shared.timeutil import business_day_key
 
 
 class RankingService:
@@ -83,11 +85,7 @@ class RankingService:
         return self._recorded_quit_cache
 
     def day_key(self, offset_days: int = 0, now: Optional[datetime] = None) -> str:
-        current = now or self._now()
-        if current.hour < 4:
-            current = current - timedelta(days=1)
-        current = current + timedelta(days=offset_days)
-        return current.strftime("%Y-%m-%d")
+        return business_day_key(offset_days, now or self._now())
 
     def record_closed(
         self,
@@ -99,6 +97,11 @@ class RankingService:
         duration_min,
         group_id,
     ) -> None:
+        """一局结束的唯一记账入口：写 session 明细 + 日聚合时长。
+
+        session_id 由「业务日 + 开始时间 + AppID」决定，多群同时监控同一玩家时
+        明细只落一次；日聚合按 (sid, gameid) 累加。
+        """
         self.record_session(
             sid=sid,
             gameid=gameid,
@@ -224,15 +227,7 @@ class RankingService:
     def target_sids(self, group_id: Optional[str] = None) -> set:
         plugin = self._plugin
         groups = getattr(plugin, "group_steam_ids", {}) or {}
+        push_groups = getattr(plugin, "push_groups", {}) or {}
         if group_id:
-            direct = groups.get(group_id, [])
-            push_ids = [
-                sid
-                for sid, targets in (getattr(plugin, "push_groups", {}) or {}).items()
-                if group_id in {str(target) for target in targets}
-            ]
-            return set(direct) | set(push_ids)
-        sids = set()
-        for group_ids in groups.values():
-            sids.update(group_ids)
-        return sids
+            return set(sids_for_group(groups, push_groups, group_id))
+        return all_group_sids(groups)

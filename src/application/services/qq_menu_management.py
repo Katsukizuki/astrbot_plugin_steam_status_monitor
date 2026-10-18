@@ -9,23 +9,15 @@ from ...infrastructure.clients.qqofficial_panel import (
     QQOfficialPanelClient,
     QQOfficialPanelError,
 )
+from ...presentation.web.qqofficial_settings import DEFAULT_QQ_MENU_COMMANDS
 from ...shared.logging import logger
-
-
-DEFAULT_MENU_COMMANDS = [
-    {"command": "/steam help", "description": "查看 Steam 插件指令帮助"},
-    {"command": "/steam list", "description": "查看本群玩家当前状态"},
-    {"command": "/steam rank", "description": "查看本群今日时长排行"},
-    {"command": "/steam rank 7", "description": "查看本群最近七天排行"},
-    {"command": "/steam rank 30", "description": "查看本群最近三十天排行"},
-]
 
 
 class QQMenuManagementMixin:
     """编排 QQ 面板用例，宿主插件只负责命令和事件适配。"""
 
     def _qq_menu_panel(self) -> dict[str, Any]:
-        commands = self.config.get("qq_menu_commands", DEFAULT_MENU_COMMANDS)
+        commands = self.config.get("qq_menu_commands", DEFAULT_QQ_MENU_COMMANDS)
         items = []
         for command_item in commands:
             command = str(command_item.get("command", "")).strip()
@@ -92,13 +84,6 @@ class QQMenuManagementMixin:
                 )
         return group_openids, None
 
-    def _qq_menu_lock_for_use(self):
-        lock = getattr(self, "_qq_menu_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._qq_menu_lock = lock
-        return lock
-
     async def qq_menu_sync(self, event) -> str:
         if not self.config.get("qq_menu_enabled", False):
             return "QQ 指令面板未启用，请先在插件配置中开启 qq_menu_enabled。"
@@ -110,7 +95,7 @@ class QQMenuManagementMixin:
             return error
         try:
             client, _ = self._qq_menu_client(event)
-            async with self._qq_menu_lock_for_use():
+            async with self._qq_menu_lock:
                 panel_id = str(self.config.get("qq_menu_panel_id", "")).strip()
                 action = "更新"
                 if panel_id:

@@ -15,6 +15,36 @@ PRESENCE_OFFLINE_DEBOUNCE_SECONDS = 180
 # 赶不上窗口节奏，须钳制 next_poll_time 强制复查。
 PRESENCE_RECHECK_INTERVAL_SECONDS = 60
 
+PERSONA_STATUS_BY_CODE = {
+    0: "offline",
+    1: "online",
+    2: "busy",
+    3: "away",
+    4: "snooze",
+    5: "trade",
+    6: "play",
+}
+
+STATUS_LABELS = {
+    "playing": "正在游戏",
+    "online": "在线",
+    "busy": "忙碌",
+    "away": "离开",
+    "snooze": "打盹",
+    "trade": "想交易",
+    "play": "想玩游戏",
+    "offline": "离线",
+    "error": "异常",
+}
+
+
+def persona_status(code, default: str = "online") -> str:
+    """personastate 数值 → 统一状态标识。"""
+    try:
+        return PERSONA_STATUS_BY_CODE.get(int(code or 0), default)
+    except (TypeError, ValueError):
+        return default
+
 
 @dataclass(frozen=True)
 class PresenceEvent:

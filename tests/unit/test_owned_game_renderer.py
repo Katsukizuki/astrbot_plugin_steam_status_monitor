@@ -58,8 +58,7 @@ class RenderOwnedGameImageTests(unittest.TestCase):
 class RenderOwnedGameWrapperTests(unittest.IsolatedAsyncioTestCase):
     async def test_wrapper_offline_fallbacks_to_placeholder(self):
         with patch("src.presentation.renderers.owned_game.get_avatar_path", new=AsyncMock(return_value=None)), \
-             patch("src.presentation.renderers.owned_game.get_avatar_frame_path", new=AsyncMock(return_value=None)), \
-             patch("src.presentation.renderers.owned_game.get_avatar_frame_url", new=AsyncMock(return_value=None)), \
+             patch("src.presentation.renderers.owned_game.resolve_avatar_frame", new=AsyncMock(return_value=None)), \
              patch("src.presentation.renderers.owned_game._download_image", new=AsyncMock(return_value=None)), \
              patch("src.presentation.renderers.owned_game.get_horizontal_cover_path", new=AsyncMock(return_value=None)), \
              patch("src.presentation.renderers.owned_game.get_cover_path", new=AsyncMock(return_value=None)):

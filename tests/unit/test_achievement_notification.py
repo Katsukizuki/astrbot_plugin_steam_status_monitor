@@ -18,6 +18,7 @@ class AchievementNotificationTest(unittest.TestCase):
                 self.API_KEY = "test_key"
                 self.notify_sessions = {"1001": "aiocqhttp:GroupMessage:0_1001"}
                 self.push_groups = {}
+                self.group_steam_ids = {"1001": ["76561198000000001"]}
                 self.context = MagicMock()
                 self.context.send_message = AsyncMock()
 

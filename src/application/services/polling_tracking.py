@@ -51,103 +51,139 @@ class PollingTrackingMixin:
             self._startup_stale_groups.clear()
 
     async def global_poll_and_log_loop(self):
-        '''全局定时并发查询所有群Steam状态，按动态间隔判断是否需要查询，40秒统一输出日志'''
+        """全局定时轮询：每分钟对齐整分钟，跨群合并查询并统一输出日志。"""
         while True:
             try:
-                # 计算距离下一个整分钟0秒的秒数
-                now = time.time()
-                next_minute = (int(now) // 60 + 1) * 60
-                await asyncio.sleep(max(0, next_minute - now))
-                # 0秒：跨群收集所有到点的SteamID，合并为一次批量查询（N群=1次API调用+自动去重）
-                group_ids = list(self.running_groups)  # 只轮询已启动的群，避免未启动群残留轮询
-                group_sids = {}  # {group_id: [sid, ...]}
-                all_sids_set = set()
-                now2 = time.time()
-                for group_id in group_ids:
-                    if not self.group_monitor_enabled.get(group_id, True):
-                        continue
-                    steam_ids = self.group_steam_ids.get(group_id, [])
-                    next_poll = self.next_poll_time.setdefault(group_id, {})
-                    sids_to_query = list(dict.fromkeys(
-                        sid for sid in steam_ids
-                        if now2 >= next_poll.get(sid, 0)
-                    ))
-                    if not sids_to_query:
-                        continue
-                    group_sids[group_id] = sids_to_query
-                    all_sids_set.update(sids_to_query)
-                # 每日排行榜自动推送（以凌晨4:00为一天分界，推送时间可在配置中设定）
-                # 注意：此检查必须放在 continue 之前，否则当没有玩家需要轮询时会跳过排行榜推送
-                now_dt = datetime.now()
-                push_hour = getattr(self, 'rank_push_hour', 8)
-                push_minute = getattr(self, 'rank_push_minute', 30)
-                if now_dt.hour == push_hour and now_dt.minute == push_minute:
-                    ranking = getattr(self, "ranking_service", None)
-                    push_date_key = ranking.day_key(-1) if ranking is not None else None
-                    if push_date_key and self._last_rank_push_date != push_date_key and hasattr(self, 'rank_push_groups') and (self.rank_push_groups or getattr(self, 'rank_push_all', False)):
-                        self._last_rank_push_date = push_date_key
-                        logger.info(f"[排行榜] 开始每日自动推送，时间={push_hour}:{push_minute:02d}，目标群: {self.rank_push_groups if self.rank_push_groups else '全部群(rank_push_all)'}")
-                        asyncio.create_task(self.rank_view.push_daily())
-                # 节流保存：本轮有脏数据且超过间隔则落盘，避免每次 check_status_change 都写盘
-                if getattr(self, '_data_dirty', False) and (time.time() - getattr(self, '_last_save_time', 0)) >= getattr(self, '_save_interval', 300):
-                    try:
-                        self._save_persistent_data(force=True)
-                    except Exception as e:
-                        logger.error(f"[SteamStatusMonitor] 节流保存失败: {e}")
+                await self._sleep_to_next_minute()
+                group_sids, now = self._collect_due_sids()
+                await self._maybe_push_daily_rank()
+                await self._flush_state_if_due()
                 # 离线玩家可能数十分钟才再入轮询，deadline 必须每分钟单独检查。
                 # 必须在 Steam 请求之前结算并立刻 flush，否则超时会把结束卡拖到下一局开始才发出。
-                await self.session_service.tick_due(int(now2))
-                # 下线防抖待定到期结算（180 秒确认窗），结果随本轮 flush 发出
-                self._settle_pending_offline_presence(int(now2))
+                await self.session_service.tick_due(int(now))
+                self._settle_pending_offline_presence(int(now))
                 await self._flush_pending_end_notifications()
                 if not group_sids:
                     await asyncio.sleep(40)  # 本轮无到点，跳过
                     continue
-                # 一次批量查询所有到点SteamID（去重），大幅减少API调用
-                all_sids = list(all_sids_set)
-                global_status_map = await self._fetch_statuses_while_ticking(all_sids)
-                # 各群并行处理状态变更检测
-                async def query_one_group(gid, sids):
-                    if not self.group_monitor_enabled.get(gid, True):
-                        return
-                    round_msg_lines = []
-                    tasks = []
-                    for sid in sids:
-                        override = global_status_map.get(sid)
-                        tasks.append(self.check_status_change(gid, single_sid=sid, status_override=override))
-                    if tasks:
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-                        for msg in results:
-                            if isinstance(msg, Exception):
-                                logger.error(f"[轮询] check_status_change 异常: {msg} (gid={gid})")
-                                continue
-                            if msg:
-                                round_msg_lines.append(msg)
-                    if round_msg_lines:
-                        self._last_round_logs.append((gid, "\n".join(round_msg_lines)))
-                poll_tasks = [query_one_group(gid, sids) for gid, sids in group_sids.items()]
-                await asyncio.gather(*poll_tasks, return_exceptions=True)
-                # 统一 flush 本轮收集的所有通知（开始游戏 + 延迟退出的结束游戏），合并发送
+                await self._poll_groups(group_sids)
                 await self._flush_pending_end_notifications()
-                # 40秒统一输出日志
                 await asyncio.sleep(40)
-                if self._last_round_logs:
-                    if self.detailed_poll_log:
-                        all_logs = []
-                        for group_id, logstr in self._last_round_logs:
-                            all_logs.append(f"群{group_id}：\n" + logstr)
-                        logger.info("====== Steam状态监控轮询日志 ======\n" + "\n".join(all_logs) + "\n=====================================================")
-                    else:
-                        logger.info("周期轮询成功")
-                self._last_round_logs.clear()
+                self._emit_round_logs()
             except asyncio.CancelledError:
-                # terminate 主动取消，正常退出循环，不要吞掉
                 logger.info("[SteamStatusMonitor] 主轮询循环已取消")
                 raise
             except Exception:
-                # 其他异常：保留堆栈后继续循环，防止单次异常导致轮询彻底失效
+                # 保留堆栈后继续循环，防止单次异常导致轮询彻底失效
                 logger.exception("[SteamStatusMonitor] 主轮询循环异常，5 秒后继续")
                 await asyncio.sleep(5)
+
+    async def _sleep_to_next_minute(self):
+        """对齐到下一个整分钟，保证 tick_due 与批量查询的节奏稳定。"""
+        now = time.time()
+        next_minute = (int(now) // 60 + 1) * 60
+        await asyncio.sleep(max(0, next_minute - now))
+
+    def _collect_due_sids(self):
+        """跨群收集本轮到点的 SteamID。
+
+        Returns:
+            ({group_id: [sid, ...]}, now)。只包含已启动且开启监控的群。
+        """
+        group_sids = {}
+        now = time.time()
+        for group_id in list(self.running_groups):
+            if not self.group_monitor_enabled.get(group_id, True):
+                continue
+            next_poll = self.next_poll_time.setdefault(group_id, {})
+            due = list(dict.fromkeys(
+                sid
+                for sid in self.group_steam_ids.get(group_id, [])
+                if now >= next_poll.get(sid, 0)
+            ))
+            if due:
+                group_sids[group_id] = due
+        return group_sids, now
+
+    async def _maybe_push_daily_rank(self):
+        """到达配置的推送时刻且当天未推过时，异步触发昨日排行榜。"""
+        now_dt = datetime.now()
+        push_hour = self.rank_push_hour
+        push_minute = self.rank_push_minute
+        if now_dt.hour != push_hour or now_dt.minute != push_minute:
+            return
+        push_date_key = self.ranking_service.day_key(-1)
+        if self._last_rank_push_date == push_date_key:
+            return
+        if not (self.rank_push_groups or self.rank_push_all):
+            return
+        self._last_rank_push_date = push_date_key
+        logger.info(
+            f"[排行榜] 开始每日自动推送，时间={push_hour}:{push_minute:02d}，"
+            f"目标群: {self.rank_push_groups if self.rank_push_groups else '全部群(rank_push_all)'}"
+        )
+        asyncio.create_task(self.rank_view.push_daily())
+
+    async def _flush_state_if_due(self):
+        """节流落盘：有脏数据且超过保存间隔时写盘，避免每次状态变更都 IO。"""
+        if not self._data_dirty:
+            return
+        if (time.time() - self._last_save_time) < self._save_interval:
+            return
+        try:
+            self._save_persistent_data(force=True)
+        except Exception as exc:
+            logger.error(f"[SteamStatusMonitor] 节流保存失败: {exc}")
+
+    async def _poll_groups(self, group_sids):
+        """批量查询一次状态，并让各群并发消费同一份结果。"""
+        all_sids = list(dict.fromkeys(
+            sid for sids in group_sids.values() for sid in sids
+        ))
+        status_map = await self._fetch_statuses_while_ticking(all_sids)
+
+        async def query_one_group(gid, sids):
+            if not self.group_monitor_enabled.get(gid, True):
+                return
+            tasks = [
+                self.check_status_change(
+                    gid,
+                    single_sid=sid,
+                    status_override=status_map.get(sid),
+                )
+                for sid in sids
+            ]
+            if not tasks:
+                return
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            lines = []
+            for message in results:
+                if isinstance(message, Exception):
+                    logger.error(f"[轮询] check_status_change 异常: {message} (gid={gid})")
+                elif message:
+                    lines.append(message)
+            if lines:
+                self._last_round_logs.append((gid, "\n".join(lines)))
+
+        await asyncio.gather(
+            *(query_one_group(gid, sids) for gid, sids in group_sids.items()),
+            return_exceptions=True,
+        )
+
+    def _emit_round_logs(self):
+        """本轮日志统一输出：详细模式按群展开，否则只报一句成功。"""
+        if not self._last_round_logs:
+            return
+        if self.detailed_poll_log:
+            logs = [f"群{group_id}：\n{log_text}" for group_id, log_text in self._last_round_logs]
+            logger.info(
+                "====== Steam状态监控轮询日志 ======\n"
+                + "\n".join(logs)
+                + "\n====================================================="
+            )
+        else:
+            logger.info("周期轮询成功")
+        self._last_round_logs.clear()
 
     async def _fetch_statuses_while_ticking(self, steam_ids, tick_interval=1.0):
         """拉取 Steam 状态期间继续结算到期会话，避免超时把结束卡堵住。"""

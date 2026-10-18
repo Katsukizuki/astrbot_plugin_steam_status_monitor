@@ -8,26 +8,11 @@ import unicodedata
 
 import httpx
 
+from ...infrastructure.clients.errors import ProviderError
+from ...shared.endpoints import ITAD_API_BASE
 from ...shared.logging import logger
-try:
-    from ...infrastructure.clients.errors import ProviderError
-except ImportError:
-    class ProviderError(RuntimeError):
-        def __init__(self, code, message="", *, status_code=None, retryable=False):
-            self.code = code
-            self.status_code = status_code
-            self.retryable = retryable
-            super().__init__(message or code)
-try:
-    from ...shared.network import httpx_client_kwargs
-except ImportError:
-    def httpx_client_kwargs(proxy=None):
-        return {'proxy': proxy} if proxy else {}
-try:
-    from .steam import steam_store_client_kwargs
-except ImportError:
-    def steam_store_client_kwargs(proxy=None):
-        return httpx_client_kwargs(proxy)
+from ...shared.network import httpx_client_kwargs
+from .steam import steam_store_client_kwargs
 
 
 @dataclass
@@ -49,7 +34,7 @@ class ITADGame:
 
 
 class ITADClient:
-    BASE_URL = "https://api.isthereanydeal.com"
+    BASE_URL = ITAD_API_BASE
 
     def __init__(self, api_key: str = "", proxy=None, base_url: str = ""):
         self.api_key = (api_key or "").strip()

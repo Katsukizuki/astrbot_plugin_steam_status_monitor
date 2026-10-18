@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, List, Optional
+from typing import Awaitable, Callable, Optional
 
 from ...infrastructure.cache.inflight import InFlightRequests
 from ...infrastructure.cache.price_cache import PriceTTLCache
@@ -140,6 +140,11 @@ class PriceQueryService:
         include_itad: bool = True,
         include_reviews: Optional[bool] = None,
     ) -> PriceCard:
+        """聚合并返回价格卡数据：核心信息限时 CORE_BUDGET_SECONDS，增强信息用剩余预算。
+
+        Raises:
+            TimeoutError: 核心数据超时，调用方应提示稍后重试。
+        """
         started = asyncio.get_running_loop().time()
         core_deadline = started + self.CORE_BUDGET_SECONDS
         core_task = asyncio.create_task(
@@ -383,8 +388,8 @@ class PriceQueryService:
                 region_prices[actual] = priced
         reviews = None
         if detail:
-            detail["review_all"] = (reviews or {}).get("all") or {}
-            detail["review_schinese"] = (reviews or {}).get("schinese") or {}
+            detail.setdefault("review_all", {})
+            detail.setdefault("review_schinese", {})
         store_appid = (detail or {}).get("store_appid") or game.appid
         store_url = f"https://store.steampowered.com/app/{store_appid}/" if store_appid else ""
         actual_store_region = str((detail or {}).get("_store_region") or "").upper()

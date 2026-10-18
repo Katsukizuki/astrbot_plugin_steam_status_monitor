@@ -46,26 +46,16 @@ class SteamStatusMonitorV3(
 
     def __init__(self, context: Context, config=None):
         super().__init__(context)
+        # 运行状态容器统一持有分群状态（见 StateBackedMonitorMixin 的属性代理）
         self.monitor_state = MonitorStateStore()
-        # 插件运行状态标志，重启后自动丢失
-        if hasattr(self, '_ssm_running') and self._ssm_running:
-            logger.error("当前插件已在运行中。请重启astrbot而非重载插件")
-            return
-        self._ssm_running = True
+        self.is_running = True
         self._plugin_version = "4.10.2"
         self.context = context
-        # 分群管理：所有状态数据均以 group_id 为 key
-        self.group_steam_ids = {}         # {group_id: [steamid, ...]}
-        self.group_last_states = {}       # {group_id: {steamid: status}}
-        self.group_last_quit_times = {}   # {group_id: {steamid: {gameid: quit_time}}}
-        self.group_pending_logs = {}      # {group_id: {steamid: {gameid: log_dict}}}
-        self.group_recent_games = {}      # {group_id: [gameid, ...]}
         self._session_meta = {}           # {(group_id, sid): {player_name, game_name, avatar_url}}
         self.superpower = SuperpowerPicker(ABILITIES_PATH)
-        self._game_name_cache = {}  # 修复: 游戏名缓存，防止 AttributeError
+        self._game_name_cache = {}
         apply_runtime_config(self, config)
         self.price_candidates = PriceCandidateCache()
-        self.next_poll_time = {}  # {group_id: {steamid: next_time}}
         # 数据持久化目录：统一到 AstrBot 规范的 data/plugin_data/<plugin_name>/；
         # 升级后首次启动自动迁移旧目录 data/steam_status_monitor/ 的数据（仅一次，旧目录保留作备份）
         from ..infrastructure.persistence.data_dir import ensure_plugin_data_dir
@@ -103,7 +93,7 @@ class SteamStatusMonitorV3(
         # --- WebUI 群自动补全 notify_sessions ---
         self._auto_fill_notify_sessions()
         # --- 新增：重启后自动恢复所有群的轮询 ---
-        if hasattr(self, 'notify_sessions') and self.notify_sessions and self.API_KEY and self.group_steam_ids:
+        if self.notify_sessions and self.API_KEY and self.group_steam_ids:
             logger.info(f"[SteamStatusMonitor] 检测到 notify_sessions={self.notify_sessions}，自动启动监控轮询")
             for group_id in self.notify_sessions:
                 if group_id in self.group_steam_ids and self.group_monitor_enabled.get(group_id, True):
@@ -150,6 +140,9 @@ class SteamStatusMonitorV3(
         self._load_bind_data()
         # --- 通知合并缓冲区：SessionService 将开始/结束通知写入此队列，由主轮询统一 flush ---
         self._pending_end_notifications = {}  # {group_id: [notification_dict, ...]}
+        self._sent_notification_events = {}   # {event_key: 发送时间戳}，去重用
+        self._inflight_notification_events = set()
+        self._notification_flush_lock = asyncio.Lock()
         # --- 游戏库新入库播报：独立服务 + 独立后台 task（默认 30 分钟一轮，不阻塞主轮询） ---
         self.owned_games = OwnedGamesService(self)
         self._owned_games_task = asyncio.create_task(self.owned_games.run_loop())
@@ -180,25 +173,21 @@ class SteamStatusMonitorV3(
         itad_client = getattr(self, 'ITAD_CLIENT', None)
         if itad_client is not None:
             await itad_client.close_http_client()
-        if getattr(self, "price_query", None) is not None:
-            await self.price_query.close()
-        candidates = getattr(self, "price_candidates", None)
-        if candidates is not None:
-            candidates.clear()
+        await self.price_query.close()
+        self.price_candidates.clear()
         await close_steam_store_client(self)
-        if hasattr(self, 'achievement_poll_tasks'):
-            for task in self.achievement_poll_tasks.values():
-                if task and not task.done():
-                    task.cancel()
-                    pending.append(task)
-            self.achievement_poll_tasks.clear()
+        for task in self.achievement_poll_tasks.values():
+            if task and not task.done():
+                task.cancel()
+                pending.append(task)
+        self.achievement_poll_tasks.clear()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self.achievement_snapshots.clear()
         # 保存持久化数据（强制落盘，不节流）
         self._save_persistent_data(force=True)
         # 重置运行标志，允许下次重载正常初始化
-        self._ssm_running = False
+        self.is_running = False
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam on")

@@ -3,6 +3,24 @@ from src.application.services.monitor_admin import MonitorAdminService
 from src.domain.monitoring import MonitorStateStore
 
 
+class _OwnedGamesStub:
+    """游戏库快照服务的替身：只记录清理调用。"""
+
+    def __init__(self):
+        self.forgotten = []
+        self.pruned = 0
+        self.cleared = 0
+
+    def forget_and_flush(self, sid):
+        self.forgotten.append(sid)
+
+    def prune_orphans(self):
+        self.pruned += 1
+
+    def clear_and_flush(self):
+        self.cleared += 1
+
+
 class PluginStub:
     max_group_size = 5
 
@@ -25,6 +43,7 @@ class PluginStub:
         self.achievement_fail_count = {}
         self._session_meta = {}
         self.config = {}
+        self.owned_games = _OwnedGamesStub()
 
     @property
     def group_steam_ids(self):

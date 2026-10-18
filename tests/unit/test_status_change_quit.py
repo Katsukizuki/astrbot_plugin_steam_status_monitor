@@ -5,6 +5,16 @@ from src.application.services.session_quit import SessionQuitMixin
 from src.application.services.status_change_tracking import StatusChangeTrackingMixin
 
 
+class _RecordingRanking:
+    """记录 close 事件的账本替身（SessionService 现在只依赖 RankingService）。"""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def record_closed(self, sid, gameid, game_name, started_at, ended_at, duration_min, group_id):
+        self.plugin.playtime.append((sid, gameid, game_name, duration_min))
+
+
 class FakePlugin(SessionQuitMixin, StatusChangeTrackingMixin):
     def __init__(self, status):
         self.status = status
@@ -33,12 +43,7 @@ class FakePlugin(SessionQuitMixin, StatusChangeTrackingMixin):
         self._data_dirty = False
         self.playtime = []
         self.sessions = []
-
-    def _record_playtime(self, sid, gameid, game_name, duration_min):
-        self.playtime.append((sid, gameid, game_name, duration_min))
-
-    def _record_session(self, **kwargs):
-        self.sessions.append(kwargs)
+        self.ranking_service = _RecordingRanking(self)
 
     def _end_game_tip(self, duration_min):
         return "tip"

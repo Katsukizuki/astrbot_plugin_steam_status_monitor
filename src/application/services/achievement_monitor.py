@@ -4,19 +4,23 @@ import asyncio
 import httpx
 import io
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from typing import Set, Optional, Dict, Any
 
+from ...shared.endpoints import STEAM_API_BASE
 from ...shared.fonts import load_truetype
 from ...shared.paths import IMAGES_DIR
+from ...presentation.renderers.drawing import wrap_text
 from ...shared.logging import logger
 from ...shared.network import aiohttp_connector, httpx_client_kwargs
 
+_MEASURE_DRAW = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
 
 class AchievementMonitor:
-    def __init__(self, data_dir: str, steam_api_base: str = "https://api.steampowered.com", proxy: str = None):
+    def __init__(self, data_dir: str, steam_api_base: str = "", proxy: str = None):
         self.data_dir = data_dir
-        self.steam_api_base = (steam_api_base or "https://api.steampowered.com").rstrip("/")
+        self.steam_api_base = (steam_api_base or STEAM_API_BASE).rstrip("/")
         self.proxy = proxy
         self.initial_achievements = {}  # {(group_id, steamid, appid): set_of_achievement_names}
         os.makedirs(data_dir, exist_ok=True)
@@ -105,7 +109,7 @@ class AchievementMonitor:
                 with open(self.achievements_file, 'r', encoding='utf-8') as f:
                     self.initial_achievements = json.load(f)
         except Exception as e:
-            print(f"加载成就缓存失败: {e}")
+            logger.debug(f"加载成就缓存失败: {e}")
             self.initial_achievements = {}
     
     def _save_achievements_cache(self):
@@ -114,7 +118,7 @@ class AchievementMonitor:
             with open(self.achievements_file, 'w', encoding='utf-8') as f:
                 json.dump(self.initial_achievements, f, ensure_ascii=False)
         except Exception as e:
-            print(f"保存成就缓存失败: {e}")
+            logger.debug(f"保存成就缓存失败: {e}")
     
     async def get_player_achievements(self, api_key: str, group_id: str, steamid: str, appid: int) -> Optional[Set[str]]:
         """
@@ -124,7 +128,7 @@ class AchievementMonitor:
         仅当 HTTP 400 且返回 no stats（游戏本身无成就统计）时才加入黑名单并跳过后续轮询。
         """
         # 黑名单机制
-        if hasattr(self, 'achievement_blacklist') and str(appid) in self.achievement_blacklist:
+        if str(appid) in self.achievement_blacklist:
             return None
         url = f"{self.steam_api_base}/ISteamUserStats/GetPlayerAchievements/v1/"
         lang_list = ["schinese", "english", "en"]
@@ -179,7 +183,7 @@ class AchievementMonitor:
                 except Exception as e:
                     logger.warning(f"[成就获取] appid={appid} 请求异常: {e} (第{attempt+1}次, lang={lang})")
         if saw_no_stats:
-            print(f"游戏 {appid} 已加入成就黑名单（无成就统计）")
+            logger.debug(f"游戏 {appid} 已加入成就黑名单（无成就统计）")
             logger.info(f"[成就黑名单] 游戏 {appid} 无成就统计，已加入黑名单并跳过轮询")
             self.achievement_blacklist.add(str(appid))
             self._save_blacklist()
@@ -192,7 +196,7 @@ class AchievementMonitor:
         若 description 为空，自动尝试多语言
         """
         # 黑名单机制
-        if hasattr(self, 'achievement_blacklist') and str(appid) in self.achievement_blacklist:
+        if str(appid) in self.achievement_blacklist:
             return {}
         # 优先用缓存
         cache_key = (group_id, appid)
@@ -208,9 +212,9 @@ class AchievementMonitor:
                     # 成就元数据
                     resp = await client.get(url)
                     if resp.status_code == 400:
-                        print(f"获取成就schema失败: HTTP 400，通常为appid错误或该游戏无成就，appid={appid}，尝试降级用GetPlayerAchievements")
+                        logger.debug(f"获取成就schema失败: HTTP 400，通常为appid错误或该游戏无成就，appid={appid}，尝试降级用GetPlayerAchievements")
                         if not api_key or not steamid:
-                            print("降级拉取成就详情失败：未传递api_key或steamid参数")
+                            logger.debug("降级拉取成就详情失败：未传递api_key或steamid参数")
                             return {}
                         # 降级多语言重试
                         for lang2 in lang_list:
@@ -240,17 +244,17 @@ class AchievementMonitor:
                                         if any(a.get("description") for a in data["playerstats"]["achievements"]):
                                             break
                                 except Exception as e:
-                                    print(f"降级解析GetPlayerAchievements json失败: {e} resp.text={resp2.text[:200]}")
+                                    logger.debug(f"降级解析GetPlayerAchievements json失败: {e} resp.text={resp2.text[:200]}")
                             else:
-                                print(f"降级GetPlayerAchievements失败: HTTP {resp2.status_code}")
+                                logger.debug(f"降级GetPlayerAchievements失败: HTTP {resp2.status_code}")
                         return details
                     if resp.status_code != 200:
-                        print(f"获取成就schema失败: HTTP {resp.status_code} url={url}")
+                        logger.debug(f"获取成就schema失败: HTTP {resp.status_code} url={url}")
                         continue
                     try:
                         schema = resp.json()
                     except Exception as e:
-                        print(f"解析成就schema json失败: {e} resp.text={resp.text[:200]}")
+                        logger.debug(f"解析成就schema json失败: {e} resp.text={resp.text[:200]}")
                         continue
                     achievements = {}
                     if "game" in schema and "availableGameStats" in schema["game"]:
@@ -269,13 +273,13 @@ class AchievementMonitor:
                             }
                     resp2 = await client.get(url_stats)
                     if resp2.status_code != 200:
-                        print(f"获取成就解锁率失败: HTTP {resp2.status_code} url={url_stats}")
+                        logger.debug(f"获取成就解锁率失败: HTTP {resp2.status_code} url={url_stats}")
                         percents = {}
                     else:
                         try:
                             stats = resp2.json()
                         except Exception as e:
-                            print(f"解析成就解锁率json失败: {e} resp.text={resp2.text[:200]}")
+                            logger.debug(f"解析成就解锁率json失败: {e} resp.text={resp2.text[:200]}")
                             stats = {}
                         percents = {}
                         if "achievementpercentages" in stats and "achievements" in stats["achievementpercentages"]:
@@ -293,21 +297,10 @@ class AchievementMonitor:
                     if any(a.get("description") for a in achievements.values()):
                         break
             except Exception as e:
-                print(f"获取成就详细信息异常: {e}")
+                logger.debug(f"获取成就详细信息异常: {e}")
         # 获取成功后写入缓存
         self.details_cache[cache_key] = details
         return details
-    
-    async def check_new_achievements(self, api_key: str, group_id: str, steamid: str, appid: int, player_name: str, game_name: str) -> Set[str]:
-        key = (group_id, steamid, appid)
-        current_achievements = await self.get_player_achievements(api_key, group_id, steamid, appid)
-        if current_achievements is None:
-            return set()
-        initial_achievements = self.initial_achievements.get(str(key), set())
-        new_achievements = current_achievements - set(initial_achievements)
-        self.initial_achievements[str(key)] = list(current_achievements)
-        self._save_achievements_cache()
-        return new_achievements
     
     def clear_game_achievements(self, group_id: str, steamid: str, appid: str):
         key = (group_id, steamid, appid)
@@ -338,28 +331,7 @@ class AchievementMonitor:
             )
         return "\n".join(lines)
     
-    def _wrap_text(self, text, font, max_width):
-        """自动换行，返回行列表"""
-        if not text:
-            return [""]
-        lines = []
-        line = ""
-        dummy_img = Image.new("RGB", (10, 10))
-        draw = ImageDraw.Draw(dummy_img)
-        for char in text:
-            bbox = draw.textbbox((0, 0), line + char, font=font)
-            width = bbox[2] - bbox[0]
-            if width <= max_width:
-                line += char
-            else:
-                if line:
-                    lines.append(line)
-                line = char
-        if line:
-            lines.append(line)
-        return lines
-
-    async def render_achievement_image(self, achievement_details: dict, new_achievements: set, player_name: str = "", steamid: str = None, appid: int = None, unlocked_set: set = None, font_path=None) -> bytes:
+    async def render_achievement_image(self, achievement_details: dict, new_achievements: set, player_name: str = "", unlocked_set: set = None, font_path=None) -> bytes:
         # 风格化：圆角卡片、icon透明、自动换行、无表情符号、官方风格进度条
         width = 420
         padding_v = 18
@@ -383,11 +355,8 @@ class AchievementMonitor:
         font_game_small = load_truetype("NotoSansHans-Regular.otf", 12, fallbacks=extra)
         font_time = load_truetype("NotoSansHans-Regular.otf", 10, fallbacks=extra)
 
-        # 1. 统计全成就进度（总进度，和本次解锁无关）
-        if unlocked_set is None:
-            unlocked_set = set()
-            if steamid is not None and appid is not None:
-                unlocked_set = await self.get_player_achievements(os.environ.get('STEAM_API_KEY', ''), steamid, appid) or set()
+        # 1. 统计全成就进度（总进度，和本次解锁无关）；调用方负责提供已解锁集合
+        unlocked_set = set(unlocked_set or ())
         unlocked_achievements = len(unlocked_set)
         total_achievements = len(achievement_details)
         progress_percent = int(unlocked_achievements / total_achievements * 100) if total_achievements else 0
@@ -448,8 +417,8 @@ class AchievementMonitor:
             percent_str = f"{percent_val:.1f}%" if percent_val is not None else "未知"
             percent_num = percent_val if percent_val is not None else 0
             # 自动换行
-            name_lines = self._wrap_text(name, font_name, max_text_width)
-            desc_lines = self._wrap_text(desc, font_desc, max_text_width)
+            name_lines = wrap_text(_MEASURE_DRAW, name, font_name, max_text_width)
+            desc_lines = wrap_text(_MEASURE_DRAW, desc, font_desc, max_text_width)
             # 估算卡片高度
             card_h = max(icon_size + 24, len(name_lines)*22 + len(desc_lines)*18 + 60)
             card_heights.append(card_h)

@@ -8,10 +8,7 @@ def should_skip_game(config, gameid) -> bool:
     ids_str = (config or {}).get("game_filter_ids", "") or ""
     if not str(ids_str).strip():
         return False
-    try:
-        filter_ids = [x.strip() for x in str(ids_str).split(",") if x.strip()]
-    except Exception:
-        return False
+    filter_ids = [x.strip() for x in str(ids_str).split(",") if x.strip()]
     if mode == "白名单":
         return str(gameid) not in filter_ids
     if mode == "黑名单":
