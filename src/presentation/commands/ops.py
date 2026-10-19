@@ -185,7 +185,8 @@ async def test_achievement_render(plugin, event, steamid: str, gameid: int, coun
     font_path = resolve_font_path('NotoSansHans-Regular.otf')
     try:
         img_bytes = await plugin.achievement_monitor.render_achievement_image(
-            details, unlocked, player_name=player_name, font_path=font_path
+            details, unlocked, player_name=player_name,
+            unlocked_set=unlocked, font_path=font_path,
         )
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
             tmp.write(img_bytes)
@@ -210,7 +211,7 @@ async def test_game_start_render(plugin, event, steamid: str, gameid: int):
             f"avatar_url={avatar_url} zh_game_name={zh_game_name} en_game_name={en_game_name}"
         )
         superpower = plugin.superpower.get(steamid)
-        print(f"[superpower] test_game_start_render superpower={superpower}")
+        logger.debug(f"[superpower] test_game_start_render superpower={superpower}")
         font_path = resolve_font_path('NotoSansHans-Regular.otf')
         online_count = await plugin.get_game_online_count(gameid)
         img_bytes = await render_game_start(

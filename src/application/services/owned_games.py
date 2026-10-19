@@ -8,7 +8,6 @@
 """
 import asyncio
 import time
-from datetime import datetime, timedelta
 
 from ...domain.monitoring.game_filter import should_skip_game
 from ...infrastructure.clients.itad import ITADGame
@@ -19,6 +18,11 @@ from ...infrastructure.clients.steam import (
 )
 from ...infrastructure.persistence.owned_games_store import OwnedGamesStore
 from ...shared.logging import logger
+from ...shared.timeutil import (
+    DAY_ROLLOVER_HOUR,
+    business_day_key,
+    seconds_to_next_business_day,
+)
 
 PENDING_MAX_TRIES = 5
 MIN_INTERVAL_SECONDS = 600
@@ -27,7 +31,6 @@ DEFAULT_DAILY_BUDGET = 3000
 DEFAULT_MAX_PER_NOTIFY = 5
 DEFAULT_GRACE_DAYS = 7
 RECENT_HISTORY_LIMIT = 20
-DAY_ROLLOVER_HOUR = 4
 
 
 class OwnedGamesService:
@@ -54,12 +57,6 @@ class OwnedGamesService:
 
     def forget(self, sid) -> bool:
         return self.store.forget(sid)
-
-    def forget_many(self, sids) -> bool:
-        changed = False
-        for sid in sids or []:
-            changed = self.store.forget(sid) or changed
-        return changed
 
     def clear(self) -> None:
         self.store.clear()
@@ -96,29 +93,41 @@ class OwnedGamesService:
     def _enabled(self) -> bool:
         return bool((self.plugin.config or {}).get("enable_owned_games_notify", False))
 
-    def _interval(self) -> int:
+    def _config_int(self, key, default, *, minimum=None, maximum=None, zero_as_default=False) -> int:
         try:
-            seconds = int(self.plugin.config.get("owned_games_poll_interval", DEFAULT_INTERVAL_SECONDS))
+            value = int(self.plugin.config.get(key, default))
         except (TypeError, ValueError):
-            seconds = DEFAULT_INTERVAL_SECONDS
-        return max(MIN_INTERVAL_SECONDS, seconds or DEFAULT_INTERVAL_SECONDS)
+            value = default
+        if zero_as_default and not value:
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _interval(self) -> int:
+        return self._config_int(
+            "owned_games_poll_interval",
+            DEFAULT_INTERVAL_SECONDS,
+            minimum=MIN_INTERVAL_SECONDS,
+            zero_as_default=True,
+        )
 
     def _max_per_notify(self) -> int:
-        try:
-            value = int(self.plugin.config.get("owned_games_max_per_notify", DEFAULT_MAX_PER_NOTIFY))
-        except (TypeError, ValueError):
-            value = DEFAULT_MAX_PER_NOTIFY
-        return min(20, max(1, value or DEFAULT_MAX_PER_NOTIFY))
+        return self._config_int(
+            "owned_games_max_per_notify",
+            DEFAULT_MAX_PER_NOTIFY,
+            minimum=1,
+            maximum=20,
+            zero_as_default=True,
+        )
 
     def _include_free(self) -> bool:
         return bool(self.plugin.config.get("owned_games_include_free", True))
 
     def _grace_seconds(self) -> int:
-        try:
-            days = int(self.plugin.config.get("owned_games_grace_days", DEFAULT_GRACE_DAYS))
-        except (TypeError, ValueError):
-            days = DEFAULT_GRACE_DAYS
-        return max(0, days) * 86400
+        return self._config_int("owned_games_grace_days", DEFAULT_GRACE_DAYS, minimum=0) * 86400
 
     def _ignore_appids(self) -> set:
         raw = str(self.plugin.config.get("owned_games_ignore_appids", "") or "")
@@ -195,6 +204,14 @@ class OwnedGamesService:
         return sids
 
     async def sync_all(self, baseline_only=False):
+        """对所有在监控中的玩家做一轮游戏库差分。
+
+        Args:
+            baseline_only: True 时只更新基线，不播报新增（手动同步默认行为）。
+
+        Returns:
+            {"players", "added", "baselines", "failed"} 汇总。
+        """
         routing = self._routing()
         stale = self.store.prune(self._known_sids())
         if stale:
@@ -599,23 +616,15 @@ class OwnedGamesService:
         logger.warning(f"[游戏库] Steam 接口限流（429），全局退避 {delay}s")
 
     def _daily_budget(self) -> int:
-        try:
-            value = int(self.plugin.config.get("owned_games_daily_budget", DEFAULT_DAILY_BUDGET))
-        except (TypeError, ValueError):
-            value = DEFAULT_DAILY_BUDGET
-        return max(50, value or DEFAULT_DAILY_BUDGET)
+        return self._config_int(
+            "owned_games_daily_budget",
+            DEFAULT_DAILY_BUDGET,
+            minimum=50,
+            zero_as_default=True,
+        )
 
     def _current_day_key(self):
-        ranking = getattr(self.plugin, "ranking_service", None)
-        if ranking is not None:
-            try:
-                return ranking.day_key(0)
-            except Exception:
-                pass
-        now = datetime.now()
-        if now.hour < DAY_ROLLOVER_HOUR:
-            now = now - timedelta(days=1)
-        return now.strftime("%Y-%m-%d")
+        return business_day_key(0)
 
     def _budget_available(self) -> bool:
         key = self._current_day_key()
@@ -628,8 +637,4 @@ class OwnedGamesService:
         self._day_calls += 1
 
     def _seconds_to_next_day(self) -> int:
-        now = datetime.now()
-        target = now.replace(hour=DAY_ROLLOVER_HOUR, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target = target + timedelta(days=1)
-        return max(60, int((target - now).total_seconds()) + 60)
+        return seconds_to_next_business_day()

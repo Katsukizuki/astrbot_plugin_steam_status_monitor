@@ -6,12 +6,13 @@ import os
 import io
 import math
 import asyncio
-import httpx
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont
-from .game_start import get_avatar_frame_url, get_avatar_frame_path
+from PIL import Image, ImageDraw
+from .assets import load_avatar_image
 from ...shared.fonts import load_truetype
+from .drawing import truncate_text
 from ...shared.logging import logger
+from ...shared.utils.duration import format_duration
 
 # Steam 深色主题色板（参考 steam_list_render）
 BG_TOP = (44, 62, 80)        # #2c3e50
@@ -81,52 +82,8 @@ def _get_bold_font(font_path, size):
 
 
 def _format_hours(minutes):
-    """分钟转可读时长"""
-    h = minutes / 60.0
-    if h >= 1:
-        return f"{h:.1f}h"
-    return f"{int(minutes)}min"
-
-
-def _truncate_text(draw, text, font, max_width):
-    """截断过长文本，加省略号"""
-    # 防御性清洗：确保 text 是字符串
-    if isinstance(text, (tuple, list)):
-        text = text[0] if text else ""
-    text = str(text) if text is not None else ""
-    bbox = draw.textbbox((0, 0), text, font=font)
-    if bbox[2] - bbox[0] <= max_width:
-        return text
-    for i in range(len(text) - 1, 0, -1):
-        truncated = text[:i] + "…"
-        bbox = draw.textbbox((0, 0), truncated, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            return truncated
-    return "…"
-
-
-async def _fetch_avatar(avatar_url, data_dir, sid, proxy=None):
-    """获取玩家头像（复用缓存）"""
-    if not avatar_url:
-        return None
-    avatar_dir = os.path.join(data_dir, "avatars")
-    os.makedirs(avatar_dir, exist_ok=True)
-    path = os.path.join(avatar_dir, f"{sid}.jpg")
-    if os.path.exists(path):
-        try:
-            return Image.open(path).convert("RGBA")
-        except Exception:
-            pass
-    try:
-        async with httpx.AsyncClient(timeout=10, proxy=proxy) as client:
-            resp = await client.get(avatar_url)
-            if resp.status_code == 200:
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-                return Image.open(io.BytesIO(resp.content)).convert("RGBA")
-    except Exception:
-        pass
-    return None
+    """分钟转可读时长（排行榜用紧凑格式）"""
+    return format_duration(minutes, style="compact")
 
 
 def _split_segment_widths(minutes, fill_w):
@@ -357,18 +314,26 @@ async def render_rank_image(data_dir, rank_data, period_label, font_path=None, p
     draw.text(((WIDTH - bbox2[2] + bbox2[0]) // 2, 50), subtitle, font=font_subtitle, fill=(143, 152, 160))
 
     # 3. 并发获取头像
-    avatar_tasks = [_fetch_avatar(p.get("avatar_url"), data_dir, p["sid"], proxy=proxy) for p in rank_data]
+    avatar_tasks = [
+        load_avatar_image(data_dir, p["sid"], p.get("avatar_url"), proxy=proxy)
+        for p in rank_data
+    ]
     avatars = await asyncio.gather(*avatar_tasks, return_exceptions=True)
 
     # 4. 获取每个玩家主玩游戏封面（取时长最高的游戏）
-    cover_tasks = []
-    for p in rank_data:
-        top_game_id = p.get("top_game_id")
-        if cover_fetcher and top_game_id:
-            cover_tasks.append(cover_fetcher(top_game_id))
-        else:
-            cover_tasks.append(_async_none())
-    covers = await asyncio.gather(*cover_tasks, return_exceptions=True)
+    covers = [None] * len(rank_data)
+    pending_covers = [
+        (index, cover_fetcher(player["top_game_id"]))
+        for index, player in enumerate(rank_data)
+        if cover_fetcher and player.get("top_game_id")
+    ]
+    if pending_covers:
+        results = await asyncio.gather(
+            *(task for _, task in pending_covers), return_exceptions=True
+        )
+        for (index, _), result in zip(pending_covers, results):
+            if not isinstance(result, Exception):
+                covers[index] = result
 
     # 5. 绘制每个玩家卡片
     for idx, player in enumerate(rank_data):
@@ -410,7 +375,7 @@ async def render_rank_image(data_dir, rank_data, period_label, font_path=None, p
                         frame_img_rgba = frame_img.copy()
                         img.alpha_composite(frame_img_rgba, (avatar_x - frame_offset, avatar_y - frame_offset))
                     except Exception as e:
-                        print(f"[rank_render] 头像框渲染失败: {e}")
+                        logger.debug(f"[rank_render] 头像框渲染失败: {e}")
             except Exception:
                 draw.rounded_rectangle((avatar_x, avatar_y, avatar_x + AVATAR_SIZE, avatar_y + AVATAR_SIZE), radius=12, fill=(60, 70, 85))
         else:
@@ -418,14 +383,14 @@ async def render_rank_image(data_dir, rank_data, period_label, font_path=None, p
 
         # 玩家名（加粗放大，截断过长名称）
         name_x = cx + TABLE_LEFT
-        player_name = _truncate_text(draw, player["name"], font_name, 200)
+        player_name = truncate_text(draw, player["name"], font_name, 200)
         draw.text((name_x, cy + 16), player_name, font=font_name, fill=(255, 255, 255))
 
         # 总时长（金色醒目）
         draw.text((name_x, cy + 44), f"总时长 {_format_hours(player['total_minutes'])}", font=font_time, fill=(255, 200, 60))
 
         # 横版封面（右侧）
-        cover_path = covers[idx] if not isinstance(covers[idx], Exception) else None
+        cover_path = covers[idx]
         cover_x = cx + cw - COVER_W - 16
         cover_y = cy + 14
         if cover_path and os.path.exists(cover_path):
@@ -457,7 +422,7 @@ async def render_rank_image(data_dir, rank_data, period_label, font_path=None, p
         for row_i, (gname, gtime, gcolor) in enumerate(display_items):
             row_y = cy + TABLE_TOP + row_i * TABLE_ROW_H
             # 游戏名左对齐（截断 + 对应颜色）
-            truncated = _truncate_text(draw, gname, font_game, name_max_w)
+            truncated = truncate_text(draw, gname, font_game, name_max_w)
             draw.text((tbl_left, row_y), truncated, font=font_game, fill=gcolor)
             # 时长右对齐（同色）
             time_bbox = draw.textbbox((0, 0), gtime, font=font_game)
@@ -489,8 +454,3 @@ async def render_rank_image(data_dir, rank_data, period_label, font_path=None, p
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format='PNG')
     return buf.getvalue()
-
-
-async def _async_none():
-    """异步返回None的辅助函数"""
-    return None

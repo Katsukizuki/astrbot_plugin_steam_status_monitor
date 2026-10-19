@@ -181,12 +181,6 @@ async def price(plugin, event, auto_first: bool, prefix: str):
             yield event.plain_result(f"价格已获取，但卡片生成失败。\n{card.store_message}")
         else:
             yield event.plain_result("价格已获取，但卡片生成失败，请稍后重试。")
-        return
-
-    if card.store_message:
-        yield event.plain_result(card.store_message)
-    else:
-        yield event.plain_result("未找到对应的 Steam 商店链接。")
 
 
 async def openbox(plugin, event, steamid: str):

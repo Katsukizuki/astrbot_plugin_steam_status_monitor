@@ -1,6 +1,9 @@
 import math
 from datetime import datetime, timedelta
 
+from ...domain.monitoring.roster import all_sids, push_sids, sids_for_group
+from ...shared.timeutil import business_day_start
+
 
 def round_minutes(value):
     """把分钟值规范为 2 位小数，供 Web API 输出使用。"""
@@ -20,9 +23,7 @@ MAX_SESSION_SPAN_SECONDS = 86400
 
 def build_report_window(now, days, offset):
     """Return the report time window using the dashboard's 04:00 day boundary."""
-    boundary_today = now.replace(hour=4, minute=0, second=0, microsecond=0)
-    if now < boundary_today:
-        boundary_today -= timedelta(days=1)
+    boundary_today = business_day_start(now)
     range_end = boundary_today + timedelta(days=offset + 1)
     return range_end - timedelta(days=days), range_end
 
@@ -123,24 +124,18 @@ def build_groups(plugin):
     last_states = getattr(plugin, "group_last_states", {}) or {}
     result = {}
     for group_id, direct_ids in list(groups.items()):
-        visible_ids = list(direct_ids)
-        visible_ids.extend(
-            sid
-            for sid, target_groups in push_groups.items()
-            if str(group_id) in {str(target) for target in target_groups}
-            and sid not in visible_ids
-        )
+        direct_set = {str(sid) for sid in direct_ids}
         states = last_states.get(group_id, {})
         result[group_id] = [
             {
-                "sid": str(sid),
-                "name": display_names.get(str(sid), str(sid)),
-                "gameid": states.get(str(sid), {}).get("gameid", ""),
-                "game": states.get(str(sid), {}).get("gameextrainfo", ""),
-                "personastate": states.get(str(sid), {}).get("personastate", 0),
-                "is_push_group": sid not in direct_ids,
+                "sid": sid,
+                "name": display_names.get(sid, sid),
+                "gameid": states.get(sid, {}).get("gameid", ""),
+                "game": states.get(sid, {}).get("gameextrainfo", ""),
+                "personastate": states.get(sid, {}).get("personastate", 0),
+                "is_push_group": sid not in direct_set,
             }
-            for sid in visible_ids
+            for sid in sids_for_group(groups, push_groups, group_id)
         ]
     return result
 
@@ -149,31 +144,29 @@ def build_player_search_index(plugin):
     display_names = _build_display_names(plugin)
     groups = getattr(plugin, "group_steam_ids", {}) or {}
     push_groups = getattr(plugin, "push_groups", {}) or {}
-    result = [
-        {
-            "sid": str(sid),
-            "name": display_names.get(str(sid), str(sid)),
-            "group_id": group_id,
-            "is_push_group": False,
-        }
-        for group_id, steam_ids in list(groups.items())
-        for sid in list(steam_ids)
-    ]
-    result.extend(
-        {
-            "sid": str(sid),
-            "name": display_names.get(str(sid), str(sid)),
-            "group_id": group_id,
-            "is_push_group": True,
-        }
-        for sid, target_groups in push_groups.items()
-        for group_id in target_groups
-        if str(sid) not in {
-            str(item["sid"])
-            for item in result
-            if str(item["group_id"]) == str(group_id)
-        }
-    )
+    result = []
+    seen = set()
+
+    def _append(sid, group_id, is_push_group):
+        key = (str(group_id), str(sid))
+        if key in seen:
+            return
+        seen.add(key)
+        result.append(
+            {
+                "sid": str(sid),
+                "name": display_names.get(str(sid), str(sid)),
+                "group_id": group_id,
+                "is_push_group": is_push_group,
+            }
+        )
+
+    for group_id, steam_ids in list(groups.items()):
+        for sid in list(steam_ids):
+            _append(sid, group_id, False)
+    for group_id in list(groups):
+        for sid in push_sids(push_groups, group_id):
+            _append(sid, group_id, True)
     return result
 
 
@@ -234,9 +227,7 @@ def _build_heatmap_contributions(plugin, start_key, end_key, allowed_sids):
 
 
 def build_heatmap_data(plugin, period, now, group_id=None):
-    end_date = now.replace(hour=4, minute=0, second=0, microsecond=0)
-    if end_date <= now:
-        end_date += timedelta(days=1)
+    end_date = business_day_start(now) + timedelta(days=1)
     start_date = end_date - timedelta(days=period)
     start_key = start_date.strftime("%Y-%m-%d")
     end_key = end_date.strftime("%Y-%m-%d")
@@ -313,16 +304,8 @@ def _resolve_allowed_sids(plugin, group_id=None):
     groups = getattr(plugin, "group_steam_ids", {}) or {}
     push_groups = getattr(plugin, "push_groups", {}) or {}
     if group_id:
-        direct_ids = groups.get(group_id, [])
-        push_ids = [
-            sid
-            for sid, target_groups in push_groups.items()
-            if str(group_id) in {str(target) for target in target_groups}
-        ]
-        return {str(sid) for sid in [*direct_ids, *push_ids]}
-    return {
-        str(sid) for steam_ids in groups.values() for sid in steam_ids
-    } | {str(sid) for sid in push_groups}
+        return set(sids_for_group(groups, push_groups, group_id))
+    return all_sids(groups, push_groups)
 
 
 def _session_interval(session):

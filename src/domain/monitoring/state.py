@@ -28,33 +28,27 @@ class StateBackedMonitorMixin:
 
     monitor_state: MonitorStateStore
 
-    def _state(self) -> MonitorStateStore:
-        state = getattr(self, "monitor_state", None)
-        if state is None:
-            state = MonitorStateStore()
-            self.monitor_state = state
-        return state
-
 
 def _state_property(attribute: str):
     def getter(instance: StateBackedMonitorMixin):
-        return getattr(instance._state(), attribute)
+        return getattr(instance.monitor_state, attribute)
 
     def setter(instance: StateBackedMonitorMixin, value: MutableMapping):
-        setattr(instance._state(), attribute, value)
+        setattr(instance.monitor_state, attribute, value)
 
     return property(getter, setter)
 
 
-for _legacy_name, _state_name in {
-    "group_steam_ids": "group_steam_ids",
-    "group_last_states": "group_last_states",
-    "group_last_quit_times": "group_last_quit_times",
-    "group_pending_logs": "group_pending_logs",
-    "group_recent_games": "group_recent_games",
-    "playing_sessions": "playing_sessions",
-    "next_poll_time": "next_poll_time",
-    "_startup_stale_groups": "startup_stale_groups",
-    "_pending_end_notifications": "pending_end_notifications",
-}.items():
+for _legacy_name in (
+    "group_steam_ids",
+    "group_last_states",
+    "group_last_quit_times",
+    "group_pending_logs",
+    "group_recent_games",
+    "playing_sessions",
+    "next_poll_time",
+    "_startup_stale_groups",
+    "_pending_end_notifications",
+):
+    _state_name = _legacy_name.lstrip("_")
     setattr(StateBackedMonitorMixin, _legacy_name, _state_property(_state_name))

@@ -3,6 +3,9 @@ from urllib.parse import quote
 
 import httpx
 
+from ...shared.endpoints import STEAM_API_BASE
+from ...shared.logging import logger
+
 
 STEAM_STORE_BROWSE_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
 STEAM_STORE_ASSET_BASE = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps"
@@ -24,10 +27,10 @@ async def get_steam_library_cover_url(appid, api_key, proxy=None, steam_api_base
     }
     try:
         async with httpx.AsyncClient(timeout=10, proxy=proxy) as client:
-            browse_url = f"{(steam_api_base or 'https://api.steampowered.com').rstrip('/')}/IStoreBrowseService/GetItems/v1/"
+            browse_url = f"{(steam_api_base or STEAM_API_BASE).rstrip('/')}/IStoreBrowseService/GetItems/v1/"
             response = await client.get(browse_url, params=params)
         if response.status_code != 200:
-            print(
+            logger.debug(
                 "[get_steam_library_cover_url] Steam 接口请求失败: "
                 f"appid={appid}, 状态码={response.status_code}"
             )
@@ -40,11 +43,11 @@ async def get_steam_library_cover_url(appid, api_key, proxy=None, steam_api_base
         )
         assets_path = (item or {}).get("assets", {}).get("library_capsule_2x")
         if not assets_path:
-            print(f"[get_steam_library_cover_url] 未获取到 library_capsule_2x 字段: appid={appid}")
+            logger.debug(f"[get_steam_library_cover_url] 未获取到 library_capsule_2x 字段: appid={appid}")
             return None
         return f"{STEAM_STORE_ASSET_BASE}/{appid}/{quote(assets_path, safe='/')}"
     except Exception as e:
-        print(
+        logger.debug(
             "[get_steam_library_cover_url] Steam 接口异常: "
             f"appid={appid}, 异常类型={type(e).__name__}"
         )

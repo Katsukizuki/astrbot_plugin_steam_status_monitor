@@ -44,6 +44,8 @@ class NotificationDeduplicationTests(unittest.TestCase):
             },
         )
         self.plugin = plugin_type()
+        self.plugin._sent_notification_events = {}
+        self.plugin._inflight_notification_events = set()
         self.notification = {
             "type": "start",
             "sid": "steam-id",

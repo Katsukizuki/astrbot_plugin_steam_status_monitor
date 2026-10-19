@@ -14,10 +14,12 @@ from .qqofficial_settings import (
     mask_secret,
     normalise_qq_official_settings,
 )
+from .http import query_int, read_json_object
 from .response_cache import AsyncTTLCache
-from ...application.services.monitor_admin import MonitorAdminService
+from ...application.services.monitor_admin import MonitorAdminService, MutationCode
 from ...shared.network import configure_tls, httpx_client_kwargs
 from ...shared.logging import logger
+from ...shared.timeutil import business_day_start, business_day_start_for_key
 from ...shared.utils.notify_session import is_valid_group_id
 from .statistics import (
     MAX_PROFILE_DAYS,
@@ -34,36 +36,20 @@ from astrbot.core.star.command_management import (
     update_command_permission,
 )
 
-# 尝试导入父包的工具函数（运行时可能因 AstrBot 加载机制失败，优雅降级）
-try:
-    from ..renderers.rank import render_rank_image
-except ImportError:
-    render_rank_image = None
+from ..renderers.rank import render_rank_image
 
 PLUGIN_NAME = "steam_status_monitor_V3"
 
 
-def _get_player_display_name(p, sid):
-    """获取玩家显示名：绑定备注 > Steam昵称 > SteamID"""
-    # 1) 从绑定表查
-    bind_data = getattr(p, "_bind_data", {}) or {}
-    for qq, info in bind_data.items():
-        if info.get("sid") == str(sid):
-            nick = info.get("nickname", "")
-            if nick and nick != "*":
-                return nick
-            break
-    # 2) 从 last_states 查 Steam 用户名
-    for gid_states in (getattr(p, "group_last_states", {}) or {}).values():
-        state = gid_states.get(str(sid), {})
+def _get_player_display_name(plugin, sid):
+    """显示名优先级：绑定备注 > Steam 昵称 > SteamID。"""
+    steam_name = ""
+    for group_states in (plugin.group_last_states or {}).values():
+        state = group_states.get(str(sid)) or {}
         if state.get("name"):
-            return state["name"]
-    # 3) 递归查（部分数据 group_id 可能不同）
-    for gid_states in (getattr(p, "group_last_states", {}) or {}).values():
-        for _sid, state in gid_states.items():
-            if str(_sid) == str(sid) and state.get("name"):
-                return state["name"]
-    return str(sid)
+            steam_name = state["name"]
+            break
+    return plugin._resolve_bind_name(sid, steam_name)
 
 
 def _flatten_commands(commands):
@@ -226,7 +212,9 @@ class WebAdminAPI:
         return json_response({"commands": commands})
 
     async def _api_permissions_update(self, request):
-        data = await request.json()
+        data, error = await read_json_object(request)
+        if error:
+            return error
         handler_full_name = str(data.get("handler_full_name") or "").strip()
         permission = str(data.get("permission") or "").strip().lower()
         if permission not in {"admin", "member"}:
@@ -269,21 +257,9 @@ class WebAdminAPI:
     async def _api_dashboard_rank_image(self, request):
         """生成排行榜图片（参考 rank_render 渲染方式，使用本地缓存的封面/头像）"""
         p = self.plugin
-        if not render_rank_image:
-            return json_response(
-                {"error": "rank_render not available"},
-                status_code=500,
-            )
-
         from datetime import datetime, timedelta
-        try:
-            days = int(request.query.get("days", "7"))
-        except (ValueError, TypeError):
-            days = 7
-        try:
-            offset = int(request.query.get("offset", "0"))
-        except (ValueError, TypeError):
-            offset = 0
+        days = query_int(request, "days", 7)
+        offset = query_int(request, "offset", 0)
 
         range_start, range_end = build_report_window(datetime.now(), days, offset)
 
@@ -340,12 +316,11 @@ class WebAdminAPI:
 
         # Cover fetcher — 复用插件实例的 get_game_cover_url（水平封面 from Steam Store）
         async def cover_fetcher(gameid):
-            if hasattr(p, "get_game_cover_url"):
-                try:
-                    return await p.get_game_cover_url(gameid)
-                except Exception:
-                    pass
-            return None
+            try:
+                return await p.get_game_cover_url(gameid)
+            except Exception:
+                logger.exception("排行榜封面获取失败 (gameid=%s)", gameid)
+                return None
 
         font_path = None
         try:
@@ -381,10 +356,7 @@ class WebAdminAPI:
             days = int(request.query.get("days", "1"))
         except (ValueError, TypeError):
             days = 1
-        try:
-            offset = int(request.query.get("offset", "0"))
-        except (ValueError, TypeError):
-            offset = 0
+        offset = query_int(request, "offset", 0)
 
         # 日期范围：以凌晨4:00为边界，从今天往回推 N 天
         range_start, range_end = build_report_window(datetime.now(), days, offset)
@@ -426,7 +398,7 @@ class WebAdminAPI:
             for sid, games in date_data.items():
                 if sid in player_map:  # session_records 已覆盖此玩家，跳过 play_records 合成
                     continue
-                day_start_ts = int(datetime.strptime(date_key, "%Y-%m-%d").timestamp()) + 4 * 3600
+                day_start_ts = int(business_day_start_for_key(date_key).timestamp())
                 offset_ts = day_start_ts
                 for gid, ginfo in games.items():
                     mins = ginfo.get("minutes", 0) if isinstance(ginfo, dict) else 0
@@ -498,11 +470,7 @@ class WebAdminAPI:
     # ────── Heatmap ──────
 
     async def _api_heatmap_data(self, request):
-        try:
-            period = int(request.query.get("period", "30"))
-        except (ValueError, TypeError):
-            period = 30
-        period = max(1, min(period, 366))
+        period = query_int(request, "period", 30, minimum=1, maximum=366)
         group_id = str(request.query.get("group_id", "")).strip()
         groups = getattr(self.plugin, "group_steam_ids", {}) or {}
         if group_id and group_id not in groups:
@@ -518,11 +486,7 @@ class WebAdminAPI:
 
     async def _api_heatmap_activity(self, request):
         """用户平均活跃热度：按 10 分钟时段统计平均同时游戏人数与峰值。"""
-        try:
-            period = int(request.query.get("period", "30"))
-        except (ValueError, TypeError):
-            period = 30
-        period = max(1, min(period, 366))
+        period = query_int(request, "period", 30, minimum=1, maximum=366)
         effective_days = min(period, MAX_PROFILE_DAYS)
         group_id = str(request.query.get("group_id", "")).strip()
         groups = getattr(self.plugin, "group_steam_ids", {}) or {}
@@ -548,14 +512,9 @@ class WebAdminAPI:
         from datetime import datetime, timedelta
 
         steamid = request.match_info.get("steamid", "")
-        try:
-            period = int(request.query.get("period", "30"))
-        except (ValueError, TypeError):
-            period = 30
+        period = query_int(request, "period", 30)
 
-        end_date = datetime.now().replace(hour=4, minute=0, second=0, microsecond=0)
-        if end_date <= datetime.now():
-            end_date += timedelta(days=1)
+        end_date = business_day_start(datetime.now()) + timedelta(days=1)
         start_date = end_date - timedelta(days=period)
 
         session_records = getattr(p, "session_records", {}) or {}
@@ -708,20 +667,16 @@ class WebAdminAPI:
 
     async def _api_groups_add(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         gid = str(data.get("group_id", "")).strip()
         sid = str(data.get("steamid", ""))
         if not is_valid_group_id(gid):
             return json_response({"error": "invalid group_id"}, status_code=400)
         if not sid:
             return json_response({"error": "steamid required"}, status_code=400)
-        try:
-            resolved = await p.resolve_steam_input(sid)
-        except Exception:
-            resolved = None
+        resolved = await p.resolve_steam_input(sid)
         if not resolved or not resolved.isdigit() or len(resolved) != 17:
             return json_response(
                 {"error": "无效SteamID，支持格式：17位SteamID64 / 个人资料链接 / 8位好友码"},
@@ -730,7 +685,7 @@ class WebAdminAPI:
         sid = resolved
         result = self.admin.add_player(gid, sid)
         if not result.changed:
-            if result.message in {"already exists", "already push group"}:
+            if result.code in {MutationCode.ALREADY_EXISTS, MutationCode.ALREADY_PUSH_ROUTE}:
                 return json_response({"ok": True, "message": result.message})
             return json_response({"error": result.message}, status_code=400)
         qq = str(data.get("qq", "")).strip()
@@ -742,10 +697,9 @@ class WebAdminAPI:
 
     async def _api_groups_delete(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         gid = str(data.get("group_id", ""))
         sid = str(data.get("steamid", ""))
         if not gid or not sid:
@@ -765,10 +719,9 @@ class WebAdminAPI:
     async def _api_groups_add_group(self, request):
         """新增一个空群聊"""
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         gid = str(data.get("group_id", "")).strip()
         if not is_valid_group_id(gid):
             return json_response({"error": "invalid group_id"}, status_code=400)
@@ -783,10 +736,9 @@ class WebAdminAPI:
     async def _api_groups_delete_group(self, request):
         """删除一个群聊及其所有 SteamID"""
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         gid = str(data.get("group_id", "")).strip()
         if not gid:
             return json_response({"error": "invalid group_id"}, status_code=400)
@@ -797,10 +749,9 @@ class WebAdminAPI:
     async def _api_groups_import_batch(self, request):
         """批量导入：每行 steamid/链接 [qq] [备注]，空格分隔"""
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         gid = str(data.get("group_id", "")).strip()
         text = str(data.get("text", ""))
         if not is_valid_group_id(gid):
@@ -854,7 +805,7 @@ class WebAdminAPI:
             if not result.changed:
                 errors.append(f"第{i+1}行: {result.message}")
                 continue
-            if result.message == "added as primary monitor":
+            if result.code is MutationCode.ADDED_PRIMARY:
                 existing.add(sid)
             imported.append(sid)
 
@@ -902,10 +853,9 @@ class WebAdminAPI:
 
     async def _api_bindings_add(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         qq = str(data.get("qq", ""))
         sid = str(data.get("steamid", ""))
         nickname = str(data.get("nickname", ""))
@@ -920,10 +870,9 @@ class WebAdminAPI:
 
     async def _api_bindings_delete(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         qq = str(data.get("qq", ""))
         self.admin.remove_binding(qq)
         self._invalidate_statistics_cache()
@@ -931,10 +880,9 @@ class WebAdminAPI:
 
     async def _api_bindings_update(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         qq = str(data.get("qq", ""))
         nickname = str(data.get("nickname", ""))
         self.admin.update_binding_nickname(qq, nickname)
@@ -955,10 +903,9 @@ class WebAdminAPI:
 
     async def _api_push_update(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         try:
             hour = int(data.get("rank_push_hour", p.rank_push_hour))
             minute = int(data.get("rank_push_minute", p.rank_push_minute))
@@ -982,10 +929,9 @@ class WebAdminAPI:
 
     async def _api_push_group_add(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         gid = str(data.get("group_id", ""))
         if gid and gid not in (getattr(p, "rank_push_groups", []) or []):
             getattr(p, "rank_push_groups").append(gid)
@@ -994,10 +940,9 @@ class WebAdminAPI:
 
     async def _api_push_group_remove(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         gid = str(data.get("group_id", ""))
         groups = getattr(p, "rank_push_groups", []) or []
         if gid in groups:
@@ -1007,10 +952,9 @@ class WebAdminAPI:
 
     async def _api_push_rank_scope(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         scope = str(data.get("scope", "")).strip().lower()
         if scope not in {"group", "global"}:
             return json_response(
@@ -1038,10 +982,9 @@ class WebAdminAPI:
 
     async def _api_settings_update(self, request):
         p = self.plugin
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "invalid JSON"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
         skip_keys = {"steam_api_key", "sgdb_api_key"}
         for key, value in data.items():
             if key in skip_keys:
@@ -1091,16 +1034,14 @@ class WebAdminAPI:
                     p.STEAM_STORE_BASE = base_url or "https://store.steampowered.com"
                 else:
                     p.SGDB_API_BASE = base_url or "https://www.steamgriddb.com"
-                if hasattr(p, "achievement_monitor"):
-                    p.achievement_monitor.steam_api_base = p.STEAM_API_BASE
+                p.achievement_monitor.steam_api_base = p.STEAM_API_BASE
             elif key == "ssl_ca_file":
                 try:
                     configure_tls(value)
                 except ValueError as exc:
                     return error_response(str(exc), status_code=400)
                 p.SSL_CA_FILE = str(value or "")
-        if hasattr(p, "achievement_monitor"):
-            p.achievement_monitor.proxy = p.proxy
+        p.achievement_monitor.proxy = p.proxy
         if hasattr(p.config, "save_config"):
             p.config.save_config()
         return json_response({"ok": True})
@@ -1122,12 +1063,9 @@ class WebAdminAPI:
         return json_response(self._qq_official_settings_payload())
 
     async def _api_qq_official_settings_update(self, request):
-        try:
-            data = await request.json()
-        except Exception:
-            return json_response({"error": "请求内容必须是有效 JSON"}, status_code=400)
-        if not isinstance(data, dict):
-            return json_response({"error": "配置内容必须是对象"}, status_code=400)
+        data, error = await read_json_object(request)
+        if error:
+            return error
 
         try:
             settings = normalise_qq_official_settings(
@@ -1366,7 +1304,7 @@ class WebAdminAPI:
         # 打印日志
         for line in log:
             logger.info(f"[WebAdmin] 测试: {line}")
-            print(f"  [测试] {line}")
+            logger.debug(f"  [测试] {line}")
 
         return json_response(results)
 

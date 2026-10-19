@@ -12,6 +12,7 @@ from datetime import datetime
 from PIL import Image, ImageDraw, ImageOps
 
 from ...shared.fonts import load_truetype
+from .drawing import wrap_text
 from .game_detail import (
     STEAM_BLUE,
     STEAM_BORDER,
@@ -24,15 +25,9 @@ from .game_detail import (
     STEAM_WHITE,
     _download_image,
     _plain_text,
-    _wrap,
 )
-from .game_start import (
-    get_avatar_frame_path,
-    get_avatar_frame_url,
-    get_avatar_path,
-    get_cover_path,
-    get_horizontal_cover_path,
-)
+from .assets import get_avatar_path, resolve_avatar_frame
+from .game_start import get_cover_path, get_horizontal_cover_path
 
 CARD_WIDTH = 820
 LEFT_X = 22
@@ -109,7 +104,7 @@ def render_owned_game_image(
 
     # ---------------- 左列测量 ----------------
     name_x = LEFT_X + (AVATAR_SIZE + 16 if avatar is not None else 0)
-    name_lines = _wrap(measure, str(player_name or "Steam 玩家"), font_name,
+    name_lines = wrap_text(measure, str(player_name or "Steam 玩家"), font_name,
                        max(120, LEFT_X + LEFT_W - name_x), max_lines=2)
     badge_text = f"游戏库 {int(owned_count or 0)} 款"
     badge_w = measure.textbbox((0, 0), badge_text, font=font_badge)[2] + 20
@@ -119,13 +114,13 @@ def render_owned_game_image(
     title_lines = []
     for size in (26, 22, 18):
         candidate = load_truetype("NotoSansHans-Medium.otf", size)
-        lines = _wrap(measure, title, candidate, LEFT_W - 4)
+        lines = wrap_text(measure, title, candidate, LEFT_W - 4)
         if len(lines) <= 2:
             title_font, title_lines = candidate, lines
             break
     if title_font is None:
         title_font = load_truetype("NotoSansHans-Medium.otf", 18)
-        title_lines = _wrap(measure, title, title_font, LEFT_W - 4, max_lines=2)
+        title_lines = wrap_text(measure, title, title_font, LEFT_W - 4, max_lines=2)
 
     english_name = str(card_data.get("english_name") or card_data.get("original_name") or "")
     review_all = card_data.get("review_all") or {}
@@ -138,7 +133,7 @@ def render_owned_game_image(
 
     # ---------------- 右列测量 ----------------
     description = _plain_text(card_data.get("short_description") or "") if card_data else ""
-    desc_lines = _wrap(measure, description, font_body, RIGHT_W - 8, max_lines=6) if description else []
+    desc_lines = wrap_text(measure, description, font_body, RIGHT_W - 8, max_lines=6) if description else []
     tags = []
     if card_data:
         genres = [x.get("description", "") for x in card_data.get("genres") or [] if x.get("description")]
@@ -336,15 +331,6 @@ async def render_owned_game(
 ):
     """异步入口：并发取头像/头像框/封面后绘制，返回 PNG bytes。"""
 
-    async def resolve_frame():
-        path = await get_avatar_frame_path(data_dir, str(sid), proxy=proxy)
-        if path:
-            return path
-        url = await get_avatar_frame_url(str(sid), proxy=proxy)
-        if not url:
-            return None
-        return await get_avatar_frame_path(data_dir, str(sid), url, proxy=proxy)
-
     async def resolve_cover():
         header = (card_data or {}).get("header_image") or (card_data or {}).get("image")
         if header:
@@ -373,7 +359,7 @@ async def render_owned_game(
 
     avatar_value, frame_value, cover_value = await asyncio.gather(
         get_avatar_path(data_dir, str(sid), avatar_url, proxy=proxy),
-        resolve_frame(),
+        resolve_avatar_frame(data_dir, str(sid), proxy=proxy),
         resolve_cover(),
         return_exceptions=True,
     )

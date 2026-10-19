@@ -1,11 +1,12 @@
 import os
 import io
-import math
 import asyncio
-import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
+from ...presentation.formatters.status import persona_label
 from ...shared.fonts import load_truetype
 from ...shared.paths import IMAGES_DIR
+from .assets import load_avatar_image
+from .drawing import truncate_text
 from ...shared.logging import logger
 
 # ============ 样式参考 nonebot-plugin-steam-info 的 draw_friends_status ============
@@ -63,29 +64,6 @@ def _load_image(path, size=None):
         return None
 
 
-async def fetch_avatar(avatar_url, data_dir, sid, proxy=None):
-    if not avatar_url:
-        return None
-    avatar_dir = os.path.join(data_dir, "avatars")
-    os.makedirs(avatar_dir, exist_ok=True)
-    path = os.path.join(avatar_dir, f"{sid}.jpg")
-    if os.path.exists(path):
-        try:
-            return Image.open(path).convert("RGBA")
-        except Exception:
-            pass
-    try:
-        async with httpx.AsyncClient(timeout=10, proxy=proxy) as client:
-            resp = await client.get(avatar_url)
-            if resp.status_code == 200:
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-                return Image.open(io.BytesIO(resp.content)).convert("RGBA")
-    except Exception:
-        pass
-    return None
-
-
 def get_status_color(status):
     if status == 'playing':
         return (80, 220, 120)  # 绿色
@@ -121,20 +99,7 @@ def get_name_color(status):
 
 
 def get_status_text(status):
-    if status == 'playing':
-        return "正在游戏"
-    elif status == 'online':
-        return "在线"
-    elif status == 'away':
-        return "离开"
-    elif status == 'snooze':
-        return "打盹"
-    elif status == 'busy':
-        return "忙碌"
-    elif status == 'offline':
-        return "离线"
-    else:
-        return "异常"
+    return persona_label(status)
 
 
 _font_cache = {}
@@ -156,23 +121,6 @@ def load_font(size, weight='regular', font_path=None):
     return font
 
 
-def _fit_text(draw, text, font, max_w):
-    """文本超出 max_w 时截断并追加省略号"""
-    if max_w <= 0:
-        return ''
-    if draw.textlength(text, font=font) <= max_w:
-        return text
-    ell = '…'
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if draw.textlength(text[:mid] + ell, font=font) <= max_w:
-            lo = mid
-        else:
-            hi = mid - 1
-    return text[:lo] + ell
-
-
 def draw_parent_status(parent_name, sub_text, fonts, parent_avatar=None):
     """顶部横幅：bot 头像 + 名称 + 状态（参照 nonebot-plugin-steam-info draw_parent_status）"""
     canvas = _load_image(_res('parent_status.png'), (WIDTH, 120))
@@ -187,9 +135,9 @@ def draw_parent_status(parent_name, sub_text, fonts, parent_avatar=None):
         canvas.paste(avatar, (16, avatar_y), avatar)
     draw = ImageDraw.Draw(canvas)
     text_x = 16 + PARENT_AVATAR_SIZE + 16
-    name = _fit_text(draw, str(parent_name), fonts['parent_name'], WIDTH - text_x - 12)
+    name = truncate_text(draw, str(parent_name), fonts['parent_name'], WIDTH - text_x - 12)
     draw.text((text_x, 44), name, font=fonts['parent_name'], fill=PARENT_NAME_COLOR)
-    sub = _fit_text(draw, str(sub_text), fonts['parent_sub'], WIDTH - text_x - 12)
+    sub = truncate_text(draw, str(sub_text), fonts['parent_sub'], WIDTH - text_x - 12)
     draw.text((text_x, 68), sub, font=fonts['parent_sub'], fill=PARENT_STATUS_COLOR)
     return canvas
 
@@ -226,7 +174,7 @@ def draw_friend_status(user, avatar, fonts, avatar_frame_paths=None):
     icon_reserve = 30 if user.get('status') in ('busy', 'snooze') else 0
     name_x = MEMBER_AVATAR_X + MEMBER_AVATAR_SIZE + 18
     max_name_w = WIDTH - name_x - 12 - icon_reserve
-    name_text = _fit_text(draw, display_name, fonts['name'], max_name_w)
+    name_text = truncate_text(draw, display_name, fonts['name'], max_name_w)
     draw.text((name_x, 12), name_text, font=fonts['name'], fill=name_color)
     name_w = int(draw.textlength(name_text, font=fonts['name']))
     icon = None
@@ -253,7 +201,7 @@ def draw_friend_status(user, avatar, fonts, avatar_frame_paths=None):
     if right2:
         right_w = int(draw.textlength(right2, font=fonts['extra']))
         draw.text((WIDTH - right_w - 12, 36), right2, font=fonts['extra'], fill=COUNT_COLOR)
-        status_text = _fit_text(draw, status_text, fonts['status'], WIDTH - status_x - right_w - 12 - 12)
+        status_text = truncate_text(draw, status_text, fonts['status'], WIDTH - status_x - right_w - 12 - 12)
     draw.text((status_x, 36), status_text, font=fonts['status'], fill=status_color)
 
     # 头像 + 头像框
@@ -314,7 +262,10 @@ async def _render_steam_style(data_dir, user_list, font_path=None, proxy=None,
     error = [u for u in user_list if u.get('status') not in ('playing', 'online', 'busy', 'snooze', 'away', 'offline')]
 
     # 头像批量下载（沿用本地缓存），失败时使用默认头像
-    tasks = [fetch_avatar(u.get('avatar_url'), data_dir, str(u.get('sid', '')), proxy=proxy) for u in user_list]
+    tasks = [
+        load_avatar_image(data_dir, str(u.get('sid', '')), u.get('avatar_url'), proxy=proxy)
+        for u in user_list
+    ]
     avatars = await asyncio.gather(*tasks)
     default_avatar = _load_image(_res('unknown_avatar.jpg'))
     av_map = {
@@ -332,7 +283,7 @@ async def _render_steam_style(data_dir, user_list, font_path=None, proxy=None,
         parent_sub = f"监控中 · {len(user_list)} 位玩家"
     parent_avatar = None
     if parent_avatar_url:
-        parent_avatar = await fetch_avatar(parent_avatar_url, data_dir, "parent", proxy=proxy)
+        parent_avatar = await load_avatar_image(data_dir, "parent", parent_avatar_url, proxy=proxy)
     banner = draw_parent_status(parent_name, parent_sub, fonts, parent_avatar=parent_avatar)
     search_bar = draw_friends_search(fonts)
 
@@ -433,7 +384,10 @@ async def _render_card_style(data_dir, user_list, font_path=None, proxy=None,
     title_bbox = draw.textbbox((0,0), title, font=font_title)
     draw.text(((width-title_bbox[2]+title_bbox[0])//2, 12), title, font=font_title, fill=(255,255,255))
     # 卡片
-    tasks = [fetch_avatar(u['avatar_url'], data_dir, u['sid'], proxy=proxy) for u in user_list]
+    tasks = [
+        load_avatar_image(data_dir, str(u['sid']), u['avatar_url'], proxy=proxy)
+        for u in user_list
+    ]
     avatars = await asyncio.gather(*tasks)
     for idx, user in enumerate(user_list):
         top = CARD_MARGIN + idx * (CARD_HEIGHT + CARD_GAP) + 50
@@ -465,7 +419,7 @@ async def _render_card_style(data_dir, user_list, font_path=None, proxy=None,
                     frame_y = (CARD_HEIGHT-AVATAR_SIZE)//2 - frame_offset
                     card.alpha_composite(frame_img, (frame_x, frame_y))
                 except Exception as e:
-                    print(f"[steam_list_render] 头像框渲染失败: {e}")
+                    logger.debug(f"[steam_list_render] 头像框渲染失败: {e}")
         # 顺序：玩家名（游戏时浅绿色），在线状态/游戏名（深绿色），上次在线/已游玩时间
         name_x = 18+AVATAR_SIZE+18
         name_y = 18
@@ -517,7 +471,7 @@ async def _render_card_style(data_dir, user_list, font_path=None, proxy=None,
                 card_draw.rounded_rectangle((cx-2, cy-2, cx+cw+2, cy+ch+2), radius=4, outline=(255,255,255,180), width=2)
                 card.alpha_composite(cover_img, (cx, cy))
             except Exception as e:
-                print(f"[steam_list_render] 封面渲染失败: {e}")
+                logger.debug(f"[steam_list_render] 封面渲染失败: {e}")
         img.alpha_composite(card, (left, top))
     # 统计
     stat_str = f"在线: {sum(1 for u in user_list if u['status'] in ('playing','online','away','snooze','busy'))} / 总数: {len(user_list)}"

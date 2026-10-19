@@ -759,17 +759,10 @@ class SteamClientMixin:
         cover_path = os.path.join(cover_dir, f"{gid}.jpg")
         # 定期刷新周期（秒），如30天
         refresh_interval = 30 * 24 * 3600
-        need_refresh = force_update
-        # 判断本地缓存是否需要刷新
+        # 本地缓存未过期则直接复用；过期或 force_update 时重新下载
         if os.path.exists(cover_path) and not force_update:
-            last_mtime = os.path.getmtime(cover_path)
-            if time.time() - last_mtime > refresh_interval:
-                need_refresh = True
-            else:
+            if time.time() - os.path.getmtime(cover_path) <= refresh_interval:
                 return cover_path
-        # 先查缓存
-        if not need_refresh and hasattr(self, "_game_cover_cache") and gid in self._game_cover_cache:
-            return self._game_cover_cache[gid]
         # 多区域尝试
         lang_list = ["schinese", "japanese", "en"]
         try:

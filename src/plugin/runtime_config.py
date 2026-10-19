@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 from ..infrastructure.clients.itad import ITADClient
+from ..shared.endpoints import SGDB_API_BASE, STEAM_API_BASE, STEAM_STORE_BASE
 from ..shared.logging import logger, register_sensitive_values
 from ..shared.network import configure_tls
 from ..shared.paths import CONFIG_PATH
@@ -82,9 +83,9 @@ def apply_runtime_config(plugin, config=None):
         logger.error(f"TLS 配置无效，将使用系统默认信任链: {exc}")
         plugin.SSL_CA_FILE = ""
         configure_tls()
-    plugin.STEAM_API_BASE = (config.get("steam_api_base", "") or "https://api.steampowered.com").rstrip("/")
-    plugin.STEAM_STORE_BASE = (config.get("steam_store_base", "") or "https://store.steampowered.com").rstrip("/")
-    plugin.SGDB_API_BASE = (config.get("sgdb_api_base", "") or "https://www.steamgriddb.com").rstrip("/")
+    plugin.STEAM_API_BASE = (config.get("steam_api_base", "") or STEAM_API_BASE).rstrip("/")
+    plugin.STEAM_STORE_BASE = (config.get("steam_store_base", "") or STEAM_STORE_BASE).rstrip("/")
+    plugin.SGDB_API_BASE = (config.get("sgdb_api_base", "") or SGDB_API_BASE).rstrip("/")
     plugin.SGDB_API_KEY = config.get("sgdb_api_key", "")
     plugin.group_steam_ids = config.get("group_steam_ids", {})
     plugin.RETRY_TIMES = config.get("retry_times", 3)

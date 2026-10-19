@@ -25,6 +25,8 @@ class _Stub(NotificationTrackingMixin):
         self.STEAM_API_BASE = ""
         self.proxy = None
         self._plugin_version = "4.10.0"
+        self._sent_notification_events = {}
+        self._inflight_notification_events = set()
         self.context = _FakeContext()
 
     def _get_notify_sessions(self, group_id, sid):

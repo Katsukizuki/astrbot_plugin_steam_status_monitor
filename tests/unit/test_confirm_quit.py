@@ -3,6 +3,16 @@ import unittest
 from src.application.services.session_quit import SessionQuitMixin
 
 
+class _RecordingRanking:
+    """记录 close 事件的账本替身（SessionService 现在只依赖 RankingService）。"""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def record_closed(self, sid, gameid, game_name, started_at, ended_at, duration_min, group_id):
+        self.plugin.playtime.append((sid, gameid, duration_min))
+
+
 class FakePlugin(SessionQuitMixin):
     def __init__(self):
         self.config = {"enable_game_end_notify": True, "enable_achievement_poll": False}
@@ -21,12 +31,7 @@ class FakePlugin(SessionQuitMixin):
         self._data_dirty = False
         self.playtime = []
         self.sessions = []
-
-    def _record_playtime(self, sid, gameid, game_name, duration_min):
-        self.playtime.append((sid, gameid, duration_min))
-
-    def _record_session(self, **kwargs):
-        self.sessions.append(kwargs)
+        self.ranking_service = _RecordingRanking(self)
 
     def _end_game_tip(self, duration_min):
         return "tip"

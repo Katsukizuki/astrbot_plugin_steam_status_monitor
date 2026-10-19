@@ -1,15 +1,35 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from ...domain.monitoring import MonitorStateStore
+from ...domain.monitoring.roster import primary_group_of, sids_for_group
 from ...shared.logging import logger
 from ...shared.utils.notify_session import is_sendable_group_session, is_valid_group_id
+
+
+class MutationCode(str, Enum):
+    """名单变更结果码：供调用方分支，不要把展示文案当控制流。"""
+
+    ADDED_PRIMARY = "added_primary"
+    ADDED_PUSH_ROUTE = "added_push_route"
+    ALREADY_EXISTS = "already_exists"
+    ALREADY_PUSH_ROUTE = "already_push_route"
+    GROUP_FULL = "group_full"
+    REMOVED_PRIMARY = "removed_primary"
+    REMOVED_PUSH_ROUTE = "removed_push_route"
+    REMOVED_ALL = "removed_all"
+    REMOVED_GROUP = "removed_group"
+    ALREADY_EMPTY = "already_empty"
+    NOT_FOUND = "not_found"
+    INVALID_GROUP = "invalid_group"
 
 
 @dataclass(frozen=True)
 class GroupMutationResult:
     changed: bool
     message: str = ""
+    code: MutationCode | None = None
 
 
 @dataclass(frozen=True)
@@ -55,10 +75,10 @@ class MonitorAdminService:
         notify_session: Optional[str] = None,
     ) -> GroupMutationResult:
         if not is_valid_group_id(group_id):
-            return GroupMutationResult(False, "invalid group_id")
+            return GroupMutationResult(False, "invalid group_id", MutationCode.INVALID_GROUP)
         steam_ids = self.groups.setdefault(group_id, [])
         if steam_id in steam_ids:
-            return GroupMutationResult(False, "already exists")
+            return GroupMutationResult(False, "already exists", MutationCode.ALREADY_EXISTS)
 
         primary_group = next(
             (
@@ -69,26 +89,25 @@ class MonitorAdminService:
             None,
         )
         if primary_group is not None:
-            push_groups = getattr(self._plugin, "push_groups", None)
-            if push_groups is None:
-                push_groups = self._plugin.push_groups = {}
+            push_groups = self._plugin.push_groups
             targets = push_groups.setdefault(steam_id, [])
             if group_id not in targets:
                 targets.append(group_id)
                 self._plugin._save_push_groups()
                 self._remember_notify_session(group_id, notify_session)
-                return GroupMutationResult(True, "added as push group")
+                return GroupMutationResult(True, "added as push group", MutationCode.ADDED_PUSH_ROUTE)
             self._remember_notify_session(group_id, notify_session)
-            return GroupMutationResult(False, "already push group")
+            return GroupMutationResult(False, "already push group", MutationCode.ALREADY_PUSH_ROUTE)
 
         if len(steam_ids) >= self.max_group_size:
             return GroupMutationResult(
                 False,
                 f"group limit reached ({self.max_group_size})",
+                MutationCode.GROUP_FULL,
             )
         steam_ids.append(steam_id)
         self._plugin._save_group_steam_ids()
-        return GroupMutationResult(True, "added as primary monitor")
+        return GroupMutationResult(True, "added as primary monitor", MutationCode.ADDED_PRIMARY)
 
     def add_players(
         self,
@@ -108,23 +127,23 @@ class MonitorAdminService:
         limit = self.max_group_size
         for sid in steam_ids:
             result = self.add_player(group_id, sid, notify_session=notify_session)
-            if result.message == "already exists":
+            if result.code is MutationCode.ALREADY_EXISTS:
                 already.append(sid)
                 if bind_qq or bind_nickname:
                     binding_updated.append(sid)
                 continue
-            if result.message == "already push group":
+            if result.code is MutationCode.ALREADY_PUSH_ROUTE:
                 already_pushed.append(sid)
                 pushed_primary_groups[sid] = self.primary_group_of(sid)
                 continue
-            if result.message == "added as push group":
+            if result.code is MutationCode.ADDED_PUSH_ROUTE:
                 pushed.append(sid)
                 pushed_primary_groups[sid] = self.primary_group_of(sid)
                 continue
-            if result.message == "added as primary monitor":
+            if result.code is MutationCode.ADDED_PRIMARY:
                 added.append(sid)
                 continue
-            if "group limit reached" in result.message:
+            if result.code is MutationCode.GROUP_FULL:
                 break
         if steam_ids and (bind_qq or bind_nickname):
             for sid in steam_ids:
@@ -195,26 +214,19 @@ class MonitorAdminService:
 
     def remove_player(self, group_id: str, steam_id: str) -> GroupMutationResult:
         """删除当前群关系：分发群只移除自身路由，主群删除时若有分发路由则晋升其一为新主群。"""
-        push_groups = getattr(self._plugin, "push_groups", {}) or {}
-        direct_owner = next(
-            (
-                owner
-                for owner, owner_ids in self.groups.items()
-                if steam_id in owner_ids
-            ),
-            None,
-        )
+        push_groups = self._plugin.push_groups or {}
+        direct_owner = primary_group_of(self.groups, steam_id)
 
         # 场景1: 删除分发路由群 - 仅移除自身路由，保留主群监控
         targets = push_groups.get(steam_id, [])
         if str(group_id) != str(direct_owner):
             if str(group_id) not in {str(target) for target in targets}:
-                return GroupMutationResult(False, "player not found")
+                return GroupMutationResult(False, "player not found", MutationCode.NOT_FOUND)
             targets[:] = [target for target in targets if str(target) != str(group_id)]
             if not targets:
                 push_groups.pop(steam_id, None)
             self._plugin._save_push_groups()
-            return GroupMutationResult(True, "removed push route")
+            return GroupMutationResult(True, "removed push route", MutationCode.REMOVED_PUSH_ROUTE)
 
         # 场景2: 删除主群监控 - 检查是否需要状态晋升
         if targets:
@@ -235,15 +247,7 @@ class MonitorAdminService:
             self.groups[group_id] = [sid for sid in self.groups[group_id] if sid != steam_id]
             if not self.groups[group_id]:
                 del self.groups[group_id]
-                # 原主群已空，停止该群的监控轮询
-                running_groups = getattr(self._plugin, 'running_groups', set())
-                running_groups.discard(group_id)
-                monitor_enabled = getattr(self._plugin, 'group_monitor_enabled', {})
-                monitor_enabled.pop(group_id, None)
-                notify_sessions = getattr(self._plugin, 'notify_sessions', {})
-                notify_sessions.pop(group_id, None)
-                self._plugin._save_notify_session()
-                self._plugin._save_group_switches()
+                self._detach_group_if_empty(group_id)
             
             # 持久化（状态迁移与清理已发生，强制落盘避免异常退出前丢失）
             self._plugin._save_group_steam_ids()
@@ -252,7 +256,8 @@ class MonitorAdminService:
             
             return GroupMutationResult(
                 True,
-                f"removed primary monitor, promoted {new_primary} as new primary"
+                f"removed primary monitor, promoted {new_primary} as new primary",
+                MutationCode.REMOVED_PRIMARY,
             )
         
         # 场景3: 无分发路由群 - 完全删除
@@ -260,15 +265,7 @@ class MonitorAdminService:
             self.groups[owner] = [sid for sid in owner_ids if sid != steam_id]
             if not self.groups[owner]:
                 del self.groups[owner]
-                # 群已空，停止该群的监控轮询
-                running_groups = getattr(self._plugin, 'running_groups', set())
-                running_groups.discard(owner)
-                monitor_enabled = getattr(self._plugin, 'group_monitor_enabled', {})
-                monitor_enabled.pop(owner, None)
-                notify_sessions = getattr(self._plugin, 'notify_sessions', {})
-                notify_sessions.pop(owner, None)
-                self._plugin._save_notify_session()
-                self._plugin._save_group_switches()
+                self._detach_group_if_empty(owner)
         push_groups.pop(steam_id, None)
         self._plugin._save_group_steam_ids()
         self._plugin._save_push_groups()
@@ -276,13 +273,21 @@ class MonitorAdminService:
         self._clear_runtime_state(steam_id)
         self._remove_bindings(steam_id)
         self._forget_owned_games(steam_id)
-        return GroupMutationResult(True, "removed primary monitor and all push routes")
+        return GroupMutationResult(True, "removed primary monitor and all push routes", MutationCode.REMOVED_ALL)
     
+    def _detach_group_if_empty(self, group_id: str) -> None:
+        """群名单清空后停止该群轮询并清除通知目标。"""
+        plugin = self._plugin
+        plugin.running_groups.discard(group_id)
+        plugin.group_monitor_enabled.pop(group_id, None)
+        plugin.notify_sessions.pop(group_id, None)
+        plugin._save_notify_session()
+        plugin._save_group_switches()
+
     def _select_promotion_candidate(self, targets: list) -> str:
         """从分发路由群中选择晋升候选。优先选择已启用监控的群，否则返回第一个。"""
-        running_groups = getattr(self._plugin, 'running_groups', set())
         for target in targets:
-            if target in running_groups:
+            if target in self._plugin.running_groups:
                 return target
         return targets[0]
     
@@ -316,37 +321,38 @@ class MonitorAdminService:
 
     def _clear_runtime_state(self, steam_id: str) -> None:
         state = self._state
-        for mapping_name in (
-            "group_last_states",
-            "group_last_quit_times",
-            "next_poll_time",
+        for mapping in (
+            state.group_last_states,
+            state.group_last_quit_times,
+            state.next_poll_time,
+            state.group_pending_logs,
         ):
-            mapping = getattr(state, mapping_name, {})
             for group_id in list(mapping):
                 mapping[group_id].pop(steam_id, None)
                 if not mapping[group_id]:
                     mapping.pop(group_id, None)
-        mapping = getattr(state, "group_pending_logs", {})
-        for group_id in list(mapping):
-            mapping[group_id].pop(steam_id, None)
-            if not mapping[group_id]:
-                mapping.pop(group_id, None)
-        pending = getattr(state, "pending_end_notifications", {})
+        pending = state.pending_end_notifications
         for group_id in list(pending):
-            pending[group_id] = [item for item in pending[group_id] if str(item.get("sid", item.get("steamid", ""))) != steam_id]
+            pending[group_id] = [
+                item
+                for item in pending[group_id]
+                if str(item.get("sid", item.get("steamid", ""))) != steam_id
+            ]
             if not pending[group_id]:
                 pending.pop(group_id, None)
-        for attr in ("achievement_poll_tasks", "achievement_snapshots", "achievement_fail_count"):
-            cache = getattr(self._plugin, attr, {})
-            for key in list(cache):
-                if len(key) >= 2 and str(key[1]) == steam_id:
-                    value = cache.pop(key, None)
-                    if attr == "achievement_poll_tasks" and value:
-                        value.cancel()
+        for cache in (
+            self._plugin.achievement_poll_tasks,
+            self._plugin.achievement_snapshots,
+            self._plugin.achievement_fail_count,
+        ):
+            for key in [key for key in list(cache) if len(key) >= 2 and str(key[1]) == steam_id]:
+                value = cache.pop(key, None)
+                if cache is self._plugin.achievement_poll_tasks and value:
+                    value.cancel()
         self._plugin._save_persistent_data(force=True)
 
     def _remove_bindings(self, steam_id: str) -> None:
-        bindings = getattr(self._plugin, "_bind_data", {})
+        bindings = self._plugin._bind_data
         removed = [qq for qq, info in bindings.items() if str(info.get("sid")) == steam_id]
         for qq in removed:
             del bindings[qq]
@@ -356,25 +362,19 @@ class MonitorAdminService:
     # ========== 游戏库快照联动清理（新入库播报） ==========
 
     def _forget_owned_games(self, steam_id: str) -> None:
-        service = getattr(self._plugin, "owned_games", None)
-        if service is not None:
-            service.forget_and_flush(steam_id)
+        self._plugin.owned_games.forget_and_flush(steam_id)
 
     def _prune_owned_games(self) -> None:
-        service = getattr(self._plugin, "owned_games", None)
-        if service is not None:
-            service.prune_orphans()
+        self._plugin.owned_games.prune_orphans()
 
     def _clear_owned_games(self) -> None:
-        service = getattr(self._plugin, "owned_games", None)
-        if service is not None:
-            service.clear_and_flush()
+        self._plugin.owned_games.clear_and_flush()
 
     def add_group(self, group_id: str) -> GroupMutationResult:
         if not is_valid_group_id(group_id):
-            return GroupMutationResult(False, "invalid group_id")
+            return GroupMutationResult(False, "invalid group_id", MutationCode.INVALID_GROUP)
         if group_id in self.groups:
-            return GroupMutationResult(False, "already exists")
+            return GroupMutationResult(False, "already exists", MutationCode.ALREADY_EXISTS)
         self.groups[group_id] = []
         self._plugin._save_group_steam_ids()
         return GroupMutationResult(True)
@@ -392,9 +392,7 @@ class MonitorAdminService:
             return GroupMutationResult(False, "SteamID无效（需为64位数字串，17位）")
         if self.primary_group_of(steam_id) is None:
             return GroupMutationResult(False, "未找到已轮询该SteamID的主群，请先在任一群添加并开启监控。")
-        push_groups = getattr(self._plugin, "push_groups", None)
-        if push_groups is None:
-            push_groups = self._plugin.push_groups = {}
+        push_groups = self._plugin.push_groups
         targets = push_groups.setdefault(steam_id, [])
         already = group_id in targets
         if not already:
@@ -435,7 +433,7 @@ class MonitorAdminService:
             if str(group_id) in {str(target) for target in targets}
         ]
         if not has_primary and not routed_sids:
-            return GroupMutationResult(False, f"群聊 {group_id} 未绑定任何SteamID，无需清理。")
+            return GroupMutationResult(False, f"群聊 {group_id} 未绑定任何SteamID，无需清理。", MutationCode.NOT_FOUND)
 
         push_groups = getattr(plugin, "push_groups", {}) or {}
         for sid in list(self.groups.get(group_id, [])):
@@ -474,7 +472,7 @@ class MonitorAdminService:
         if hasattr(getattr(plugin, "config", None), "save_config"):
             plugin.config.save_config()
         self._prune_owned_games()
-        return GroupMutationResult(True, f"已删除群聊 {group_id} 的所有SteamID和分发路由，相关状态数据已清空。")
+        return GroupMutationResult(True, f"已删除群聊 {group_id} 的所有SteamID和分发路由，相关状态数据已清空。", MutationCode.REMOVED_GROUP)
 
     def clear_all_ids(self) -> GroupMutationResult:
         plugin = self._plugin
@@ -509,16 +507,11 @@ class MonitorAdminService:
         if hasattr(config, "save_config"):
             config.save_config()
         self._clear_owned_games()
-        return GroupMutationResult(True, "已删除所有群聊的所有SteamID，相关状态数据已清空。")
+        return GroupMutationResult(True, "已删除所有群聊的所有SteamID，相关状态数据已清空。", MutationCode.REMOVED_ALL)
 
     def list_group_players(self, group_id: str) -> List[Dict[str, Any]]:
-        direct_ids = [str(sid) for sid in self.groups.get(group_id, [])]
-        push_ids = [
-            str(sid)
-            for sid, target_groups in (getattr(self._plugin, "push_groups", {}) or {}).items()
-            if str(group_id) in {str(target) for target in target_groups}
-        ]
-        steam_ids = list(dict.fromkeys([*direct_ids, *push_ids]))
+        push_groups = getattr(self._plugin, "push_groups", {}) or {}
+        steam_ids = sids_for_group(self.groups, push_groups, group_id)
         group_states = self._state.group_last_states.get(group_id, {})
         primary_states = self._state.group_last_states
         return [

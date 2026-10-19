@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from ...domain.ranking.push_scopes import build_rank_push_scopes
-from ...presentation.renderers.game_start import get_avatar_frame_path, get_avatar_frame_url
+from ...presentation.renderers.assets import resolve_avatar_frame
 from ...presentation.renderers.rank import render_rank_image
 from ...shared.fonts import resolve_font_path
 from ...shared.logging import logger
@@ -18,9 +18,7 @@ def parse_rank_period(period: str = "") -> Tuple[int, str]:
     if period == "month":
         return 30, "最近30天"
     if period.isdigit():
-        days = int(period) or 1
-        if days <= 0:
-            days = 1
+        days = max(1, int(period))
         return days, f"最近{days}天"
     return 1, "今日"
 
@@ -87,16 +85,7 @@ class RankViewService:
             sid = player.get("sid", "")
             if not sid:
                 continue
-            frame_path = await get_avatar_frame_path(plugin.data_dir, sid, proxy=plugin.proxy)
-            if not frame_path:
-                frame_url = await get_avatar_frame_url(sid, proxy=plugin.proxy)
-                if frame_url:
-                    frame_path = await get_avatar_frame_path(
-                        plugin.data_dir,
-                        sid,
-                        frame_url,
-                        proxy=plugin.proxy,
-                    )
+            frame_path = await resolve_avatar_frame(plugin.data_dir, sid, proxy=plugin.proxy)
             if frame_path:
                 avatar_frame_paths[sid] = frame_path
         return avatar_frame_paths

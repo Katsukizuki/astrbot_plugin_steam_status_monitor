@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.domain.monitoring.presence import presence_transition
+from src.domain.monitoring.roster import groups_for_sid
 from src.presentation.formatters.status import format_play_duration
 from src.shared.utils.notify_session import is_sendable_group_session
 from tests.unit.test_status_change_quit import FakePlugin
@@ -61,6 +62,7 @@ def _load_notification_methods(names):
         "Image": _Image,
         "MessageChain": _MessageChain,
         "is_sendable_group_session": is_sendable_group_session,
+        "groups_for_sid": groups_for_sid,
         "format_play_duration": format_play_duration,
     }
     exec(compile(ast.fix_missing_locations(module), str(IMPLEMENTATION_PATH), "exec"), namespace)
@@ -85,6 +87,8 @@ def _build_send_plugin():
     plugin.notify_sessions = {"g1": "test:GroupMessage:123"}
     plugin.push_groups = {}
     plugin.group_monitor_enabled = {}
+    plugin._sent_notification_events = {}
+    plugin._inflight_notification_events = set()
     plugin.sent = []
 
     async def send_message(session, chain):
@@ -280,7 +284,7 @@ class PresenceSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(self.plugin.sent))
         _, chain = self.plugin.sent[0]
         texts = [component.text for component in chain.chain]
-        self.assertIn("🔵【小明】已上线\n", texts)
+        self.assertIn("🔵【小明】已上线", texts)
         offline_line = next(text for text in texts if "已离线" in text)
         self.assertIn("小红", offline_line)
         self.assertIn("本次在线 2.2小时", offline_line)
@@ -292,7 +296,7 @@ class PresenceSendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([], failed)
         _, chain = self.plugin.sent[0]
-        self.assertEqual(["🌑 小刚 已离线\n"], [component.text for component in chain.chain])
+        self.assertEqual(["🌑 【小刚】 已离线"], [component.text for component in chain.chain])
 
     async def test_presence_event_key_distinguishes_transitions(self):
         first = self.plugin._notification_event_key({"type": "offline", "sid": "s1", "event_time": 1000}, "sess")

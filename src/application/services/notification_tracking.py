@@ -9,6 +9,7 @@ from astrbot.api.message_components import Plain, Image
 from ...shared.fonts import resolve_font_path
 from ...shared.logging import logger
 from ...shared.utils.notify_session import is_sendable_group_session
+from ...domain.monitoring.roster import groups_for_sid
 from ...presentation.formatters.status import format_play_duration
 from ...presentation.renderers.game_start import render_game_start
 from ...presentation.renderers.game_end import render_game_end
@@ -24,7 +25,7 @@ class NotificationTrackingMixin:
         normalized_sid = str(sid)
         notify_sessions = {
             str(key): value
-            for key, value in (getattr(self, "notify_sessions", {}) or {}).items()
+            for key, value in (self.notify_sessions or {}).items()
         }
         enabled = getattr(self, "group_monitor_enabled", {}) or {}
 
@@ -34,21 +35,11 @@ class NotificationTrackingMixin:
         primary_session = notify_sessions.get(normalized_group_id)
         if primary_session and _group_enabled(normalized_group_id):
             sessions.append(primary_session)
-        monitored_groups = {
-            str(gid)
-            for gid, steam_ids in getattr(self, "group_steam_ids", {}).items()
-            if normalized_sid in {str(value) for value in steam_ids}
-        }
-        push_targets = (getattr(self, "push_groups", {}) or {}).get(normalized_sid)
-        if push_targets is None:
-            push_targets = next(
-                (
-                    targets
-                    for raw_sid, targets in (getattr(self, "push_groups", {}) or {}).items()
-                    if str(raw_sid) == normalized_sid
-                ),
-                [],
-            )
+        push_targets = groups_for_sid(
+            getattr(self, "group_steam_ids", {}) or {},
+            getattr(self, "push_groups", {}) or {},
+            normalized_sid,
+        )
         for push_gid in push_targets:
             normalized_push_gid = str(push_gid)
             push_session = notify_sessions.get(normalized_push_gid)
@@ -134,12 +125,8 @@ class NotificationTrackingMixin:
 
     def _should_send_notification(self, notification, session):
         now = time.time()
-        sent_events = getattr(self, "_sent_notification_events", None)
-        if sent_events is None:
-            sent_events = self._sent_notification_events = {}
-        inflight_events = getattr(self, "_inflight_notification_events", None)
-        if inflight_events is None:
-            inflight_events = self._inflight_notification_events = set()
+        sent_events = self._sent_notification_events
+        inflight_events = self._inflight_notification_events
         for old_key, sent_at in list(sent_events.items()):
             if now - sent_at >= 600:
                 del sent_events[old_key]
@@ -151,8 +138,7 @@ class NotificationTrackingMixin:
 
     def _finish_notification(self, notification, session, *, success):
         key = self._notification_event_key(notification, session)
-        inflight_events = getattr(self, "_inflight_notification_events", set())
-        inflight_events.discard(key)
+        self._inflight_notification_events.discard(key)
         if success:
             self._sent_notification_events[key] = time.time()
 
@@ -194,7 +180,7 @@ class NotificationTrackingMixin:
                 elif notification["type"] == "offline":
                     minutes = notification.get("online_minutes")
                     suffix = f"（本次在线 {format_play_duration(minutes)}）" if minutes is not None else ""
-                    line = f"🌑【{notification['name']}】 已离线{suffix}"
+                    line = f"🌑【{notification['name']}】已离线{suffix}"
                 else:
                     line = f"👋 {notification['name']} 不玩 {notification['game']}，游玩时间 {notification['duration_str']}\n"
                 if self.config.get("notify_send_text", True):
@@ -237,10 +223,7 @@ class NotificationTrackingMixin:
         return failed
 
     async def _flush_pending_end_notifications(self):
-        lock = getattr(self, "_notification_flush_lock", None)
-        if lock is None:
-            lock = self._notification_flush_lock = asyncio.Lock()
-        async with lock:
+        async with self._notification_flush_lock:
             if not self._pending_end_notifications:
                 return
             pending = self._pending_end_notifications

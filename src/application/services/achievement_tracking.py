@@ -5,6 +5,7 @@ import time
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Image, Plain
 
+from ...domain.monitoring.roster import groups_for_sid
 from ...shared.fonts import resolve_font_path
 from ...shared.logging import logger
 from ...shared.utils.notify_session import is_sendable_group_session
@@ -110,13 +111,12 @@ class AchievementTrackingMixin:
                 detail["game_name"] = game_name
 
         notify_sessions = []
-        notify_session = getattr(self, "notify_sessions", {}).get(group_id)
-        if notify_session:
-            notify_sessions.append(notify_session)
-        for push_gid in (getattr(self, "push_groups", {}) or {}).get(steamid, []):
-            push_session = getattr(self, "notify_sessions", {}).get(push_gid)
-            if push_session and push_session not in notify_sessions:
-                notify_sessions.append(push_session)
+        for group in groups_for_sid(
+            self.group_steam_ids or {}, self.push_groups or {}, steamid
+        ):
+            session = (self.notify_sessions or {}).get(group)
+            if session and session not in notify_sessions:
+                notify_sessions.append(session)
         notify_sessions = [session for session in notify_sessions if is_sendable_group_session(session)]
         if not notify_sessions:
             logger.warning("成就通知无有效会话，已跳过 (group_id=%s, steamid=%s)", group_id, steamid)
@@ -136,7 +136,7 @@ class AchievementTrackingMixin:
             try:
                 img_bytes = await self.achievement_monitor.render_achievement_image(
                     details, set(achievements_to_notify), player_name=player_name,
-                    steamid=steamid, appid=gameid, unlocked_set=unlocked_set or set(),
+                    unlocked_set=unlocked_set or set(),
                     font_path=resolve_font_path("NotoSansHans-Regular.otf"),
                 )
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:

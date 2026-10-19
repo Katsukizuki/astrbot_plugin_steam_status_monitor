@@ -1,5 +1,6 @@
 import re
 
+from ...application.services.monitor_admin import MutationCode
 from ...application.services.steam_list import handle_steam_list, render_user_list_image
 from ...application.services.player_status_view import format_alllist_text, sort_rows_for_image
 from ...shared.fonts import resolve_font_path
@@ -69,7 +70,7 @@ async def delid(plugin, event, steamid: str, group_id_param: str = ""):
             f"该SteamID不存在于群 {group_id} 的监控组或分发路由: {sid}"
         )
         return
-    if result.message == "removed push route":
+    if result.code is MutationCode.REMOVED_PUSH_ROUTE:
         yield event.plain_result(f"已关闭群 {group_id} 对 SteamID {sid} 的分发路由")
     else:
         yield event.plain_result(

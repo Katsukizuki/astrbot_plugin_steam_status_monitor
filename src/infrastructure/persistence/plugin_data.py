@@ -1,9 +1,9 @@
-from datetime import datetime, timedelta
 import json
 import os
 import time
 
 from ...shared.logging import logger
+from ...shared.timeutil import business_day_key
 from ...shared.utils.notify_session import (
     build_group_notify_session,
     is_sendable_group_session,
@@ -11,12 +11,41 @@ from ...shared.utils.notify_session import (
 )
 
 _STALE_STATE_THRESHOLD = 3600
+_MISSING = object()
 
 
 class PersistenceMixin:
+    # ========== JSON 读写边界 ==========
+
+    def _read_json(self, filename, default=_MISSING):
+        """读取 data 目录下的 JSON；缺失或损坏时返回 default（缺省为空 dict）。"""
+        fallback = {} if default is _MISSING else default
+        path = os.path.join(self.data_dir, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except FileNotFoundError:
+            return fallback
+        except (OSError, ValueError) as exc:
+            logger.warning("加载 %s 失败: %s", filename, exc)
+            return fallback
+
+    def _write_json(self, filename, data, *, indent=None) -> bool:
+        """写入 data 目录下的 JSON；失败只记录日志并返回 False。"""
+        path = os.path.join(self.data_dir, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=indent)
+            return True
+        except OSError as exc:
+            logger.warning("保存 %s 失败: %s", filename, exc)
+            return False
+
+    def _group_file_name(self, group_id, key) -> str:
+        return f"group_{group_id}_{key}.json"
+
     def _get_group_data_path(self, group_id, key):
-        """获取分群数据文件路径"""
-        return os.path.join(self.data_dir, f"group_{group_id}_{key}.json")
+        return os.path.join(self.data_dir, self._group_file_name(group_id, key))
 
     def _is_group_state_stale(self, group_id, threshold=_STALE_STATE_THRESHOLD):
         """判断该群状态缓存是否为插件停止期间遗留的旧数据。"""
@@ -26,65 +55,41 @@ class PersistenceMixin:
                 return False
             mtime = os.path.getmtime(path)
             return mtime < self._startup_time and (time.time() - mtime) > threshold
-        except Exception as e:
-            logger.warning(f"[陈旧状态] 判断 states 新鲜度失败: {e} (group_id={group_id})")
+        except OSError as exc:
+            logger.warning(f"[陈旧状态] 判断 states 新鲜度失败: {exc} (group_id={group_id})")
             return False
 
+    # ========== 启动加载 ==========
+
     def _load_persistent_data(self):
-        # 分群加载各群的状态数据
         legacy_start_play_times = {}
         legacy_pending_quit = {}
         for group_id in self.group_steam_ids:
-            try:
-                path = self._get_group_data_path(group_id, "states")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        self.group_last_states[group_id] = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 group_last_states 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "start_play_times")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        legacy_start_play_times[group_id] = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载旧 start_play_times 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "last_quit_times")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        self.group_last_quit_times[group_id] = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 group_last_quit_times 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "pending_logs")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        self.group_pending_logs[group_id] = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 group_pending_logs 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "pending_quit")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        legacy_pending_quit[group_id] = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载旧 pending_quit 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "recent_games")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        self.group_recent_games[group_id] = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 group_recent_games 失败: {e} (group_id={group_id})")
+            states = self._read_json(self._group_file_name(group_id, "states"), None)
+            if states is not None:
+                self.group_last_states[group_id] = states
+            start_times = self._read_json(self._group_file_name(group_id, "start_play_times"), None)
+            if start_times is not None:
+                legacy_start_play_times[group_id] = start_times
+            quit_times = self._read_json(self._group_file_name(group_id, "last_quit_times"), None)
+            if quit_times is not None:
+                self.group_last_quit_times[group_id] = quit_times
+            pending_logs = self._read_json(self._group_file_name(group_id, "pending_logs"), None)
+            if pending_logs is not None:
+                self.group_pending_logs[group_id] = pending_logs
+            pending_quit = self._read_json(self._group_file_name(group_id, "pending_quit"), None)
+            if pending_quit is not None:
+                legacy_pending_quit[group_id] = pending_quit
+            recent_games = self._read_json(self._group_file_name(group_id, "recent_games"), None)
+            if recent_games is not None:
+                self.group_recent_games[group_id] = recent_games
+
         session_path = os.path.join(self.data_dir, "playing_sessions.json")
         has_session_store = os.path.exists(session_path)
-        try:
-            if has_session_store:
-                with open(session_path, "r", encoding="utf-8") as f:
-                    self.session_service.load(json.load(f))
-        except Exception as e:
-            logger.warning(f"加载 playing_sessions 失败: {e}")
+        if has_session_store:
+            payload = self._read_json("playing_sessions.json", None)
+            if payload is not None:
+                self.session_service.load(payload)
         # 旧 pending_quit/start_play_times 只允许在首次升级时迁移一次。
         # playing_sessions.json 一旦存在就是唯一数据源，否则旧文件中的 notified=false
         # 会在每次重启时把已结算会话重新复活并重复发送结束卡。
@@ -94,113 +99,54 @@ class PersistenceMixin:
                 start_all=legacy_start_play_times,
                 last_all=self.group_last_states,
             )
-            try:
-                with open(session_path, "w", encoding="utf-8") as f:
-                    json.dump(self.session_service.dump(), f, ensure_ascii=False)
-            except Exception as e:
-                logger.warning(f"保存首次迁移的 playing_sessions 失败: {e}")
-        # 在线起始时间（presence）：离线推送"本次在线"时长的数据源，跨重启保持计时
-        self._presence_online_since = self._load_plain_json("presence_online_since.json")
-        # 下线防抖待定（presence）：180 秒确认窗内重启不丢，重启后由主循环继续结算
-        self._presence_pending_offline = self._load_plain_json("presence_pending_offline.json")
-
-    def _load_plain_json(self, filename, default=None):
-        """加载 data 目录下的全局 JSON 文件；缺失/损坏返回 default。"""
-        path = os.path.join(self.data_dir, filename)
-        try:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"加载 {filename} 失败: {e}")
-        return {} if default is None else default
-
-    def _save_plain_json(self, filename, data):
-        """保存 data 目录下的全局 JSON 文件。"""
-        try:
-            with open(os.path.join(self.data_dir, filename), "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"保存 {filename} 失败: {e}")
+            self._write_json("playing_sessions.json", self.session_service.dump())
+        # 在线起始时间与下线防抖待定（presence）：跨重启保持计时与确认窗
+        self._presence_online_since = self._read_json("presence_online_since.json")
+        self._presence_pending_offline = self._read_json("presence_pending_offline.json")
 
     def _save_persistent_data(self, force=False):
         '''分群保存各群的状态数据。
         - force=True 或距上次保存超过 _save_interval 才真正落盘
         - 否则只标记脏位，由主循环周期性 flush
         '''
-        if not force and (time.time() - self._last_save_time) < getattr(self, '_save_interval', 300):
+        if not force and (time.time() - self._last_save_time) < self._save_interval:
             self._data_dirty = True
             return
         self._data_dirty = False
         self._last_save_time = time.time()
         for group_id in self.group_steam_ids:
-            try:
-                path = self._get_group_data_path(group_id, "states")
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self.group_last_states.get(group_id, {}), f, ensure_ascii=False)
-            except Exception as e:
-                logger.warning(f"保存 group_last_states 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "last_quit_times")
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self.group_last_quit_times.get(group_id, {}), f, ensure_ascii=False)
-            except Exception as e:
-                logger.warning(f"保存 group_last_quit_times 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "pending_logs")
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self.group_pending_logs.get(group_id, {}), f, ensure_ascii=False)
-            except Exception as e:
-                logger.warning(f"保存 group_pending_logs 失败: {e} (group_id={group_id})")
-            try:
-                path = self._get_group_data_path(group_id, "recent_games")
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self.group_recent_games.get(group_id, []), f, ensure_ascii=False)
-            except Exception as e:
-                logger.warning(f"保存 group_recent_games 失败: {e} (group_id={group_id})")
-        try:
-            path = os.path.join(self.data_dir, "playing_sessions.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.session_service.dump(), f, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"保存 playing_sessions 失败: {e}")
-        # 保存在线起始时间与下线防抖待定（全局，按 sid；presence 推送的数据源）
-        self._save_plain_json("presence_online_since.json", self._presence_online_since)
-        self._save_plain_json("presence_pending_offline.json", self._presence_pending_offline)
-        # 保存游玩时长记录（全局，不分群）
-        try:
-            self._save_play_records()
-        except Exception as e:
-            logger.warning(f"保存 play_records 失败: {e}")
-        # 保存 session 记录（甘特图/热力图数据源）
-        try:
-            self._save_session_records()
-        except Exception as e:
-            logger.warning(f"保存 session_records 失败: {e}")
+            self._write_json(
+                self._group_file_name(group_id, "states"),
+                self.group_last_states.get(group_id, {}),
+            )
+            self._write_json(
+                self._group_file_name(group_id, "last_quit_times"),
+                self.group_last_quit_times.get(group_id, {}),
+            )
+            self._write_json(
+                self._group_file_name(group_id, "pending_logs"),
+                self.group_pending_logs.get(group_id, {}),
+            )
+            self._write_json(
+                self._group_file_name(group_id, "recent_games"),
+                self.group_recent_games.get(group_id, []),
+            )
+        self._write_json("playing_sessions.json", self.session_service.dump())
+        self._write_json("presence_online_since.json", self._presence_online_since)
+        self._write_json("presence_pending_offline.json", self._presence_pending_offline)
+        self._save_play_records()
+        self._save_session_records()
+
+    # ========== 通知目标 ==========
 
     def _load_notify_session(self):
-        path = os.path.join(self.data_dir, "notify_sessions.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.notify_sessions = json.load(f)
-                logger.info(f"[SteamStatusMonitor] 已加载 notify_sessions: {self.notify_sessions}")
-            except Exception as e:
-                logger.warning(f"加载 notify_sessions 失败: {e}")
-                self.notify_sessions = {}
-        else:
-            self.notify_sessions = {}
+        self.notify_sessions = self._read_json("notify_sessions.json")
+        logger.info(f"[SteamStatusMonitor] 已加载 notify_sessions: {self.notify_sessions}")
         self._sanitize_notify_sessions()
 
     def _save_notify_session(self):
-        if hasattr(self, 'notify_sessions'):
-            path = os.path.join(self.data_dir, "notify_sessions.json")
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self.notify_sessions, f, ensure_ascii=False)
-                logger.info(f"[SteamStatusMonitor] 已保存 notify_sessions: {self.notify_sessions}")
-            except Exception as e:
-                logger.warning(f"保存 notify_sessions 失败: {e}")
+        if self._write_json("notify_sessions.json", self.notify_sessions):
+            logger.info(f"[SteamStatusMonitor] 已保存 notify_sessions: {self.notify_sessions}")
 
     def _record_platform_id(self, event):
         """从消息事件中提取并缓存平台ID，用于WebUI自动构造通知目标"""
@@ -213,17 +159,14 @@ class PersistenceMixin:
         """为WebUI添加的群（有群有ID但无notify_sessions）自动构造通知目标"""
         if not self._platform_id:
             return
-        if not hasattr(self, 'notify_sessions'):
-            self.notify_sessions = {}
         filled = 0
-        group_ids = set(getattr(self, 'group_steam_ids', {}) or {})
-        for targets in (getattr(self, 'push_groups', {}) or {}).values():
+        group_ids = set(self.group_steam_ids or {})
+        for targets in (self.push_groups or {}).values():
             group_ids.update(str(gid) for gid in (targets or []))
         for gid in group_ids:
             if not is_valid_group_id(gid):
                 continue
-            current = self.notify_sessions.get(gid)
-            if is_sendable_group_session(current):
+            if is_sendable_group_session(self.notify_sessions.get(gid)):
                 continue
             self.notify_sessions[gid] = build_group_notify_session(self._platform_id, gid)
             filled += 1
@@ -232,10 +175,9 @@ class PersistenceMixin:
             logger.info(f"[WebUI自动投递] 已为 {filled} 个群补全通知目标")
 
     def _sanitize_notify_sessions(self):
-        sessions = getattr(self, "notify_sessions", {}) or {}
         cleaned = {}
         dropped = []
-        for gid, session in sessions.items():
+        for gid, session in (self.notify_sessions or {}).items():
             if is_valid_group_id(gid) and is_sendable_group_session(session):
                 cleaned[str(gid)] = session
             else:
@@ -245,11 +187,12 @@ class PersistenceMixin:
             logger.warning("已丢弃无效 notify_sessions: %s", dropped)
             self._save_notify_session()
 
+    # ========== 群名单与推送路由 ==========
+
     def _sanitize_group_steam_ids(self):
-        groups = getattr(self, "group_steam_ids", {}) or {}
         cleaned = {}
         dropped = []
-        for gid, steam_ids in groups.items():
+        for gid, steam_ids in (self.group_steam_ids or {}).items():
             if is_valid_group_id(gid):
                 cleaned[str(gid)] = steam_ids
             else:
@@ -261,229 +204,91 @@ class PersistenceMixin:
 
     def _load_group_steam_ids(self):
         """从 steam_groups.json 加载所有群的 SteamID 列表"""
-        path = os.path.join(self.data_dir, "steam_groups.json")
-        groups = {}
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    groups = json.load(f)
-                logger.info(f"[SteamStatusMonitor] 已加载 steam_groups.json: {groups}")
-            except Exception as e:
-                logger.warning(f"加载 steam_groups.json 失败: {e}")
+        groups = self._read_json("steam_groups.json")
         self.monitor_state.group_steam_ids = groups
         self._sanitize_group_steam_ids()
 
     def _save_group_steam_ids(self):
         """保存所有群的 SteamID 列表到 steam_groups.json"""
-        path = os.path.join(self.data_dir, "steam_groups.json")
         groups = self.monitor_state.group_steam_ids
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(groups, f, ensure_ascii=False, indent=2)
+        if self._write_json("steam_groups.json", groups, indent=2):
             logger.info(f"[SteamStatusMonitor] 已保存 steam_groups.json: {groups}")
-        except Exception as e:
-            logger.warning(f"保存 steam_groups.json 失败: {e}")
-
-    def _get_push_groups_path(self):
-        """获取 push_groups.json 文件路径"""
-        return os.path.join(self.data_dir, "push_groups.json")
 
     def _load_push_groups(self):
         """加载 SteamID -> 群号列表 的推送映射"""
-        path = self._get_push_groups_path()
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.push_groups = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 push_groups.json 失败: {e}")
-        else:
-            self.push_groups = {}
+        self.push_groups = self._read_json("push_groups.json")
 
     def _save_push_groups(self):
         """保存 SteamID -> 群号列表 的推送映射"""
-        path = self._get_push_groups_path()
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.push_groups, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"保存 push_groups.json 失败: {e}")
-
-    def _get_group_switches_path(self):
-        return os.path.join(self.data_dir, "group_switches.json")
+        self._write_json("push_groups.json", self.push_groups, indent=2)
 
     def _load_group_switches(self):
         """加载各群监控/成就开关。缺省为开启，避免旧数据把群误关。"""
-        path = self._get_group_switches_path()
-        monitor = {}
-        achievement = {}
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    payload = json.load(f) or {}
-                monitor = {
-                    str(gid): bool(enabled)
-                    for gid, enabled in (payload.get("monitor") or {}).items()
-                    if is_valid_group_id(gid)
-                }
-                achievement = {
-                    str(gid): bool(enabled)
-                    for gid, enabled in (payload.get("achievement") or {}).items()
-                    if is_valid_group_id(gid)
-                }
-            except Exception as e:
-                logger.warning(f"加载 group_switches.json 失败: {e}")
-        self.group_monitor_enabled = monitor
-        self.group_achievement_enabled = achievement
+        payload = self._read_json("group_switches.json") or {}
+        self.group_monitor_enabled = {
+            str(gid): bool(enabled)
+            for gid, enabled in (payload.get("monitor") or {}).items()
+            if is_valid_group_id(gid)
+        }
+        self.group_achievement_enabled = {
+            str(gid): bool(enabled)
+            for gid, enabled in (payload.get("achievement") or {}).items()
+            if is_valid_group_id(gid)
+        }
 
     def _save_group_switches(self):
-        path = self._get_group_switches_path()
         payload = {
             "monitor": {
                 str(gid): bool(enabled)
-                for gid, enabled in (getattr(self, "group_monitor_enabled", {}) or {}).items()
+                for gid, enabled in (self.group_monitor_enabled or {}).items()
                 if is_valid_group_id(gid)
             },
             "achievement": {
                 str(gid): bool(enabled)
-                for gid, enabled in (getattr(self, "group_achievement_enabled", {}) or {}).items()
+                for gid, enabled in (self.group_achievement_enabled or {}).items()
                 if is_valid_group_id(gid)
             },
         }
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"保存 group_switches.json 失败: {e}")
+        self._write_json("group_switches.json", payload, indent=2)
 
-    # ========== 排行榜功能：游玩时长记录持久化 ==========
+    # ========== 排行榜账本 ==========
 
     def _load_play_records(self):
-        """加载游玩时长记录"""
-        path = os.path.join(self.data_dir, "play_records.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.play_records = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 play_records.json 失败: {e}")
-                self.play_records = {}
-        else:
-            self.play_records = {}
+        self.play_records = self._read_json("play_records.json")
 
     def _save_play_records(self):
         """保存游玩时长记录，并自动清理超过30天的旧记录"""
-        if not hasattr(self, 'play_records'):
-            return
-        cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        cleaned = {}
-        for date_str, data in self.play_records.items():
-            if date_str >= cutoff_date:
-                cleaned[date_str] = data
-        self.play_records = cleaned
-        path = os.path.join(self.data_dir, "play_records.json")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.play_records, f, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"保存 play_records.json 失败: {e}")
-
-    # ========== Session 游玩记录（甘特图/热力图数据源）==========
+        cutoff_date = business_day_key(-30)
+        self.play_records = {
+            date_str: data
+            for date_str, data in self.play_records.items()
+            if date_str >= cutoff_date
+        }
+        self._write_json("play_records.json", self.play_records)
 
     def _load_session_records(self):
-        """加载 session 级别的游玩记录"""
-        path = os.path.join(self.data_dir, "session_records.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.session_records = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 session_records.json 失败: {e}")
-                self.session_records = {}
-        else:
-            self.session_records = {}
+        self.session_records = self._read_json("session_records.json")
 
     def _save_session_records(self):
         """保存 session 记录，自动清理超过90天的旧数据"""
-        if not hasattr(self, "session_records"):
-            return
-        cutoff_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-        cleaned = {}
-        for sid, sessions in self.session_records.items():
-            cleaned[sid] = [s for s in sessions if s.get("date", "") >= cutoff_date]
-        self.session_records = cleaned
-        path = os.path.join(self.data_dir, "session_records.json")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.session_records, f, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"保存 session_records.json 失败: {e}")
+        cutoff_date = business_day_key(-90)
+        self.session_records = {
+            sid: [item for item in sessions if item.get("date", "") >= cutoff_date]
+            for sid, sessions in self.session_records.items()
+        }
+        self._write_json("session_records.json", self.session_records)
 
-    def _record_session(self, sid, gameid, game_name, start_time, end_time, duration_min, group_id):
-        """记录单次游玩 session（在游戏退出确认后调用）。"""
-        ranking = getattr(self, "ranking_service", None)
-        if ranking is not None:
-            ranking.record_session(sid, gameid, game_name, start_time, end_time, duration_min, group_id)
-            return
-        if duration_min <= 0 or not gameid:
-            return
-        date_str = self._get_day_key(0)
-        start_timestamp = int(start_time) if start_time else 0
-        end_timestamp = int(end_time) if end_time else 0
-        session_id = f"{date_str}_{start_timestamp}_{gameid}"
-        sessions = self.session_records.setdefault(str(sid), [])
-        if any(item.get("session_id") == session_id for item in sessions):
-            return
-        sessions.append({
-            "session_id": session_id,
-            "gameid": str(gameid),
-            "game_name": str(game_name),
-            "start_time": start_timestamp,
-            "end_time": end_timestamp,
-            "duration_min": round(float(duration_min), 2),
-            "date": date_str,
-            "group_id": str(group_id),
-        })
-        self._session_dirty = True
-
-    def _get_day_key(self, offset_days=0):
-        ranking = getattr(self, "ranking_service", None)
-        if ranking is not None:
-            return ranking.day_key(offset_days)
-        current = datetime.now()
-        if current.hour < 4:
-            current = current - timedelta(days=1)
-        current = current + timedelta(days=offset_days)
-        return current.strftime("%Y-%m-%d")
-
-    # ========== QQ-SteamID 绑定系统 ==========
+    # ========== QQ-SteamID 绑定 ==========
 
     def _load_bind_data(self):
-        """加载QQ-SteamID绑定数据"""
-        path = os.path.join(self.data_dir, "bind_data.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self._bind_data = json.load(f)
-            except Exception as e:
-                logger.warning(f"加载 bind_data.json 失败: {e}")
-                self._bind_data = {}
-        else:
-            self._bind_data = {}
+        self._bind_data = self._read_json("bind_data.json")
 
     def _save_bind_data(self):
-        """保存QQ-SteamID绑定数据"""
-        path = os.path.join(self.data_dir, "bind_data.json")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._bind_data, f, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"保存 bind_data.json 失败: {e}")
+        self._write_json("bind_data.json", self._bind_data)
 
     def _resolve_bind_name(self, sid, steam_name=None):
-        """根据绑定表返回显示名：自定义备注 > QQ昵称 > Steam原始名"""
-        bind_data = getattr(self, '_bind_data', {})
-        for qq, info in bind_data.items():
+        """根据绑定表返回显示名：自定义备注 > Steam原始名 > SteamID"""
+        for info in self._bind_data.values():
             if info.get("sid") == str(sid):
                 nick = info.get("nickname", "")
                 if nick and nick != "*":
@@ -491,36 +296,25 @@ class PersistenceMixin:
                 break
         return steam_name or str(sid)
 
+    # ========== 排行榜推送群 ==========
+
     def _load_rank_push_groups(self):
         """加载开启了每日排行榜推送的群列表及 rank_push_all 标志"""
-        path = os.path.join(self.data_dir, "rank_push_groups.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                if isinstance(raw, dict):
-                    self.rank_push_groups = raw.get("groups", [])
-                    self.rank_push_all = raw.get("all", False)
-                elif isinstance(raw, list):
-                    # 兼容旧格式（纯列表）
-                    self.rank_push_groups = raw
-                    self.rank_push_all = False
-                else:
-                    self.rank_push_groups = []
-                    self.rank_push_all = False
-            except Exception as e:
-                logger.warning(f"加载 rank_push_groups.json 失败: {e}")
-                self.rank_push_groups = []
-                self.rank_push_all = False
+        raw = self._read_json("rank_push_groups.json", None)
+        if isinstance(raw, dict):
+            self.rank_push_groups = raw.get("groups", [])
+            self.rank_push_all = raw.get("all", False)
+        elif isinstance(raw, list):
+            # 兼容旧格式（纯列表）
+            self.rank_push_groups = raw
+            self.rank_push_all = False
         else:
             self.rank_push_groups = []
             self.rank_push_all = False
 
     def _save_rank_push_groups(self):
         """保存开启了每日排行榜推送的群列表及 rank_push_all 标志"""
-        path = os.path.join(self.data_dir, "rank_push_groups.json")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"groups": self.rank_push_groups, "all": getattr(self, 'rank_push_all', False)}, f, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"保存 rank_push_groups.json 失败: {e}")
+        self._write_json(
+            "rank_push_groups.json",
+            {"groups": self.rank_push_groups, "all": self.rank_push_all},
+        )

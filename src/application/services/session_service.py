@@ -5,9 +5,11 @@ from typing import Any, Dict, Optional, Tuple
 from ...domain.monitoring.game_filter import should_skip_game
 from ...domain.monitoring.session import PlayingSession, apply
 from ...presentation.formatters.status import format_play_duration
+from ...shared.logging import logger
 
 
 SessionKey = Tuple[str, str]
+RECENT_GAMES_LIMIT = 8
 
 
 class SessionService:
@@ -39,6 +41,17 @@ class SessionService:
         status=None,
         skip_push=False,
     ):
+        """把一次 Steam 快照推进状态机，并在事件发生时记账与推送。
+
+        Args:
+            group_id: 群标识，会话按 (group_id, sid) 隔离。
+            observed_gameid: 本轮观测到的 AppID；None/""/"0" 表示未在游戏中。
+            now: 秒级时间戳，用于状态判定与时长计算。
+            skip_push: True 时只更新基线不推送（启动初始化、手动同步）。
+
+        Returns:
+            (next_session, events)。next_session 为 None 表示会话已关闭或未开启。
+        """
         key = self._key(group_id, sid)
         async with self._locks[key]:
             current = self._sessions().get(key)
@@ -234,18 +247,10 @@ class SessionService:
                 }
 
     def _sessions(self) -> Dict[SessionKey, PlayingSession]:
-        sessions = getattr(self._plugin, "playing_sessions", None)
-        if sessions is None:
-            sessions = {}
-            self._plugin.playing_sessions = sessions
-        return sessions
+        return self._plugin.playing_sessions
 
     def _meta(self) -> Dict[SessionKey, Dict[str, Any]]:
-        meta = getattr(self._plugin, "_session_meta", None)
-        if meta is None:
-            meta = {}
-            self._plugin._session_meta = meta
-        return meta
+        return self._plugin._session_meta
 
     @staticmethod
     def _key(group_id, sid) -> SessionKey:
@@ -286,88 +291,94 @@ class SessionService:
 
     def _on_closed(self, session: PlayingSession, *, skip_push: bool):
         plugin = self._plugin
-        key = self._key(session.group_id, session.sid)
-        meta = self._meta().get(key, {})
+        meta = self._meta().get(self._key(session.group_id, session.sid), {})
         game_name = meta.get("game_name") or "未知游戏"
         player_name = meta.get("player_name") or session.sid
         duration_min = session.duration_min
-        ranking = getattr(plugin, "ranking_service", None)
-        if ranking is not None:
-            ranking.record_closed(
-                session.sid,
-                session.gameid,
-                game_name,
-                session.started_at,
-                session.exited_at or session.closed_at,
-                duration_min,
-                session.group_id,
-            )
-        else:
-            record_playtime = getattr(plugin, "_record_playtime", None)
-            record_session = getattr(plugin, "_record_session", None)
-            if callable(record_playtime):
-                record_playtime(session.sid, session.gameid, game_name, duration_min)
-            if callable(record_session):
-                record_session(
-                    sid=session.sid,
-                    gameid=session.gameid,
-                    game_name=game_name,
-                    start_time=session.started_at,
-                    end_time=session.exited_at or session.closed_at,
-                    duration_min=duration_min,
-                    group_id=session.group_id,
-                )
-        last_quit = plugin.group_last_quit_times.setdefault(session.group_id, {})
-        last_quit.setdefault(session.sid, {})[session.gameid] = int(session.closed_at or session.exited_at or 0)
 
+        plugin.ranking_service.record_closed(
+            session.sid,
+            session.gameid,
+            game_name,
+            session.started_at,
+            session.exited_at or session.closed_at,
+            duration_min,
+            session.group_id,
+        )
+        self._remember_quit_time(session)
+        snapshot = self._finish_achievement_tracking(session)
+
+        if self._should_push(session, skip_push=skip_push, config_key="enable_game_end_notify"):
+            self._enqueue_end_notification(session, player_name, game_name, duration_min, meta)
+        if not skip_push and self._is_monitor_enabled(session):
+            self._schedule_final_achievement_check(session, player_name, game_name, snapshot)
+
+    def _is_monitor_enabled(self, session: PlayingSession) -> bool:
+        return self._plugin.group_monitor_enabled.get(session.group_id, True)
+
+    def _should_push(self, session: PlayingSession, *, skip_push: bool, config_key: str) -> bool:
+        """开始/结束播报共用的开关判定：手动跳过、群开关、黑白名单、配置开关。"""
+        if skip_push or not self._is_monitor_enabled(session):
+            return False
+        if self._skip_game(session.gameid):
+            return False
+        return bool(self._plugin.config.get(config_key, True))
+
+    def _remember_quit_time(self, session: PlayingSession) -> None:
+        quit_times = self._plugin.group_last_quit_times.setdefault(session.group_id, {})
+        quit_times.setdefault(session.sid, {})[session.gameid] = int(
+            session.closed_at or session.exited_at or 0
+        )
+
+    def _finish_achievement_tracking(self, session: PlayingSession):
+        """结束一局时停止成就轮询并清理快照，返回清理前的快照供延迟补偿比对。"""
+        plugin = self._plugin
         task_key = (session.group_id, session.sid, session.gameid)
-        poll_task = getattr(plugin, "achievement_poll_tasks", {}).pop(task_key, None)
+        poll_task = plugin.achievement_poll_tasks.pop(task_key, None)
         if poll_task:
             poll_task.cancel()
-        # 结束瞬间捕获旧成就快照，传给延迟补偿作为对比基准（不被下面的 pop 清掉）
-        snap = getattr(plugin, "achievement_snapshots", {}).get(task_key)
-        getattr(plugin, "achievement_snapshots", {}).pop(task_key, None)
-        achievement_monitor = getattr(plugin, "achievement_monitor", None)
-        if achievement_monitor is not None:
-            achievement_monitor.clear_game_achievements(session.group_id, session.sid, session.gameid)
+        snapshot = plugin.achievement_snapshots.pop(task_key, None)
+        if plugin.achievement_monitor is not None:
+            plugin.achievement_monitor.clear_game_achievements(
+                session.group_id, session.sid, session.gameid
+            )
+        return snapshot
 
-        monitor_on = getattr(plugin, "group_monitor_enabled", {}).get(session.group_id, True)
-        if not skip_push and monitor_on and not self._skip_game(session.gameid) and plugin.config.get("enable_game_end_notify", True):
-            last_state = plugin.group_last_states.get(session.group_id, {}).get(session.sid) or {}
-            plugin._pending_end_notifications.setdefault(session.group_id, []).append({
-                "type": "end",
-                "name": player_name,
-                "game": game_name,
-                "duration_str": format_play_duration(duration_min),
-                "sid": session.sid,
-                "gameid": session.gameid,
-                "quit_time": session.exited_at or session.closed_at,
-                "duration_min": duration_min,
-                "avatar_url": meta.get("avatar_url") or last_state.get("avatarfull") or last_state.get("avatar"),
-                "tip_text": plugin._end_game_tip(duration_min),
-            })
-        if not skip_push and monitor_on:
-            delayed = getattr(plugin, "achievement_delayed_final_check", None)
-            if delayed is not None:
-                result = delayed(session.group_id, session.sid, session.gameid, player_name, game_name, achievements_a=snap)
-                if asyncio.iscoroutine(result):
-                    try:
-                        asyncio.get_running_loop()
-                    except RuntimeError:
-                        pass
-                    else:
-                        asyncio.create_task(result)
+    def _enqueue_end_notification(self, session, player_name, game_name, duration_min, meta) -> None:
+        plugin = self._plugin
+        last_state = plugin.group_last_states.get(session.group_id, {}).get(session.sid) or {}
+        plugin._pending_end_notifications.setdefault(session.group_id, []).append({
+            "type": "end",
+            "name": player_name,
+            "game": game_name,
+            "duration_str": format_play_duration(duration_min),
+            "sid": session.sid,
+            "gameid": session.gameid,
+            "quit_time": session.exited_at or session.closed_at,
+            "duration_min": duration_min,
+            "avatar_url": meta.get("avatar_url") or last_state.get("avatarfull") or last_state.get("avatar"),
+            "tip_text": plugin._end_game_tip(duration_min),
+        })
+
+    def _schedule_final_achievement_check(self, session, player_name, game_name, snapshot) -> None:
+        delayed = getattr(self._plugin, "achievement_delayed_final_check", None)
+        if delayed is None:
+            return
+        result = delayed(
+            session.group_id,
+            session.sid,
+            session.gameid,
+            player_name,
+            game_name,
+            achievements_a=snapshot,
+        )
+        if asyncio.iscoroutine(result):
+            asyncio.create_task(result)
 
     async def _on_started(self, session: PlayingSession, *, player_name, game_name, status, skip_push):
-        plugin = self._plugin
-        recent = plugin.group_recent_games.setdefault(session.group_id, [])
-        if session.gameid not in recent:
-            recent.append(session.gameid)
-            if len(recent) > 8:
-                recent.pop(0)
-        monitor_on = getattr(plugin, "group_monitor_enabled", {}).get(session.group_id, True)
-        if not skip_push and monitor_on and not self._skip_game(session.gameid) and plugin.config.get("enable_game_start_notify", True):
-            plugin._pending_end_notifications.setdefault(session.group_id, []).append({
+        self._remember_recent_game(session)
+        if self._should_push(session, skip_push=skip_push, config_key="enable_game_start_notify"):
+            self._plugin._pending_end_notifications.setdefault(session.group_id, []).append({
                 "type": "start",
                 "name": player_name or session.sid,
                 "game": game_name or "未知游戏",
@@ -380,6 +391,14 @@ class SessionService:
             return
         await self._ensure_achievement_poll(session, player_name=player_name, game_name=game_name)
 
+    def _remember_recent_game(self, session: PlayingSession) -> None:
+        recent = self._plugin.group_recent_games.setdefault(session.group_id, [])
+        if session.gameid in recent:
+            return
+        recent.append(session.gameid)
+        if len(recent) > RECENT_GAMES_LIMIT:
+            recent.pop(0)
+
     async def _ensure_achievement_poll(self, session: PlayingSession, *, player_name, game_name):
         plugin = self._plugin
         if not plugin.config.get("enable_achievement_poll", True):
@@ -387,7 +406,7 @@ class SessionService:
         if self._skip_game(session.gameid):
             return
         key = (session.group_id, session.sid, session.gameid)
-        if key in getattr(plugin, "achievement_poll_tasks", {}):
+        if key in plugin.achievement_poll_tasks:
             return
         monitor = getattr(plugin, "achievement_monitor", None)
         if monitor is None:
@@ -396,10 +415,6 @@ class SessionService:
             plugin.API_KEY, session.group_id, session.sid, session.gameid
         )
         plugin.achievement_snapshots[key] = list(achievements or [])
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return
         plugin.achievement_poll_tasks[key] = asyncio.create_task(
             plugin.achievement_periodic_check(
                 session.group_id, session.sid, session.gameid, player_name, game_name
@@ -432,14 +447,13 @@ class SessionService:
                         MessageChain([Plain(f"📡 网络波动：{name} 在游玩 {game_name} 时重启游戏/网络波动了")]),
                     )
                 except Exception:
-                    pass
+                    logger.warning(
+                        "网络波动通知发送失败 (session=%s, sid=%s)",
+                        session_key,
+                        session.sid,
+                    )
 
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return
         asyncio.create_task(_notify())
 
     def _skip_game(self, gameid) -> bool:
-        plugin = self._plugin
-        return should_skip_game(getattr(plugin, "config", {}) or {}, gameid)
+        return should_skip_game(self._plugin.config or {}, gameid)

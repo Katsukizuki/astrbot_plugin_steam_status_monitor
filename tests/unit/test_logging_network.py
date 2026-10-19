@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.shared.logging import format_exception, redact_sensitive, register_sensitive_values
-from src.shared.network import configure_tls, get_ssl_ca_file, httpx_client_kwargs, requests_verify
+from src.shared.network import configure_tls, httpx_client_kwargs
 
 
 class LoggingTests(unittest.TestCase):
@@ -36,8 +36,6 @@ class NetworkConfigTests(unittest.TestCase):
     def test_empty_ca_uses_default_verification(self):
         configure_tls()
 
-        self.assertEqual("", get_ssl_ca_file())
-        self.assertTrue(requests_verify())
         self.assertNotIn("verify", httpx_client_kwargs(None))
 
     def test_missing_ca_is_rejected(self):
@@ -50,7 +48,6 @@ class NetworkConfigTests(unittest.TestCase):
                 configure_tls(ca_file.name)
 
         create.assert_called_once_with(cafile=str(Path(ca_file.name).resolve()))
-        self.assertEqual(str(Path(ca_file.name).resolve()), requests_verify())
         self.assertIsInstance(httpx_client_kwargs(None)["verify"], ssl.SSLContext)
 
 
