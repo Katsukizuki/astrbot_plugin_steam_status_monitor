@@ -142,7 +142,8 @@ class StatusChangeTrackingMixin:
                 return
             # 用全局 online_since 作事件键：多群/联动推送共用同一去重键
             self._enqueue_presence(
-                group_id, sid, player_name, online_since.get(key, now), "online", None
+                group_id, sid, player_name, online_since.get(key, now), "online", None,
+                avatar_url=status.get("avatarfull") or status.get("avatar"),
             )
             return
 
@@ -188,6 +189,8 @@ class StatusChangeTrackingMixin:
                 existing["online_minutes"] = max(0.0, (now - started_at) / 60)
             if not existing.get("name") or existing.get("name") == key:
                 existing["name"] = player_name
+            if not existing.get("avatar_url"):
+                existing["avatar_url"] = status.get("avatarfull") or status.get("avatar")
         else:
             pending[key] = {
                 "detected_at": now,
@@ -196,6 +199,7 @@ class StatusChangeTrackingMixin:
                 "online_since": started_at,
                 "online_minutes": max(0.0, (now - started_at) / 60) if started_at is not None else None,
                 "name": player_name,
+                "avatar_url": status.get("avatarfull") or status.get("avatar"),
             }
         self._save_presence_state()
         self._clamp_recheck_poll(key, now, next_poll)
@@ -279,6 +283,7 @@ class StatusChangeTrackingMixin:
                     item.get("detected_at") or now,
                     "offline",
                     item.get("online_minutes"),
+                    avatar_url=item.get("avatar_url"),
                 )
 
         if changed:
@@ -298,10 +303,10 @@ class StatusChangeTrackingMixin:
                 next_poll = self.next_poll_time.setdefault(group_id, {})
                 self._clamp_recheck_poll(key, now, next_poll)
 
-    def _enqueue_presence(self, group_id, sid, player_name, event_time, kind, online_minutes):
+    def _enqueue_presence(self, group_id, sid, player_name, event_time, kind, online_minutes, avatar_url=None):
         """presence 通知入队，复用游戏通知的合并发送、去重与失败重试管线。"""
-        if not self.config.get("notify_send_text", True):
-            # 上线/下线是纯文本通知；文本关闭时没有可发送内容，直接丢弃
+        if not self.config.get("notify_send_text", True) and not self.config.get("notify_send_image", True):
+            # 文本与图片都关闭时没有可发送内容，直接丢弃
             return
         enqueue_notifications(self, group_id, [{
             "type": kind,
@@ -309,4 +314,5 @@ class StatusChangeTrackingMixin:
             "name": player_name,
             "event_time": event_time,
             "online_minutes": online_minutes,
+            "avatar_url": avatar_url,
         }])

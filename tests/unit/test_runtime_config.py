@@ -1,3 +1,4 @@
+import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -98,3 +99,35 @@ def test_apply_hot_update_owned_compact_non_int_rejected():
     assert ok is False
     assert "类型错误" in msg
     assert "owned_games_compact_max_pages" not in plugin.config
+
+
+class NotificationBoolHotUpdateTests(unittest.TestCase):
+    """上下线与图文开关的热更新：布尔语义、缺键放行、非法值拒绝。"""
+
+    def test_presence_bool_missing_key_is_allowed(self):
+        # 老配置没有该键：白名单放行，按布尔解析
+        plugin = SimpleNamespace(config={})
+        ok, _ = apply_hot_update(plugin, "enable_user_online_notify", "true")
+        self.assertTrue(ok)
+        self.assertIs(plugin.config["enable_user_online_notify"], True)
+
+    def test_bool_false_words(self):
+        for word in ("false", "0", "off", "no", "关闭"):
+            with self.subTest(word=word):
+                plugin = SimpleNamespace(config={})
+                ok, _ = apply_hot_update(plugin, "notify_send_image", word)
+                self.assertTrue(ok)
+                self.assertIs(plugin.config["notify_send_image"], False)
+
+    def test_invalid_bool_rejected(self):
+        plugin = SimpleNamespace(config={})
+        ok, msg = apply_hot_update(plugin, "notify_send_text", "abc")
+        self.assertFalse(ok)
+        self.assertIn("类型错误", msg)
+        self.assertNotIn("notify_send_text", plugin.config)
+
+    def test_existing_true_value_still_switches_off(self):
+        plugin = SimpleNamespace(config={"enable_user_offline_notify": True})
+        ok, _ = apply_hot_update(plugin, "enable_user_offline_notify", "false")
+        self.assertTrue(ok)
+        self.assertIs(plugin.config["enable_user_offline_notify"], False)

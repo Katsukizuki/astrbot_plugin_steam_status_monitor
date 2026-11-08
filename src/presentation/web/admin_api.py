@@ -15,6 +15,7 @@ from .qqofficial_settings import (
     normalise_qq_official_settings,
 )
 from .response_cache import AsyncTTLCache
+from .settings_defaults import with_notification_defaults
 from ...application.services.monitor_admin import MonitorAdminService
 from ...shared.network import configure_tls, httpx_client_kwargs
 from ...shared.logging import logger
@@ -1038,7 +1039,9 @@ class WebAdminAPI:
 
     async def _api_settings_get(self, request):
         p = self.plugin
-        config = dict(p.config)
+        # 老配置可能缺通知开关键：补 schema 默认值，避免前端显示为关闭、
+        # "保存全部设置"时把默认开启的图片/文本开关意外写成 false。
+        config = with_notification_defaults(p.config)
         for key in ("steam_api_key", "sgdb_api_key"):
             if config.get(key):
                 config[key] = "******" + config[key][-4:] if len(config[key]) > 4 else "******"

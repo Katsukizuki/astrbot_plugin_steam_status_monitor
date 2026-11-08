@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+import os
 import tempfile
 import time
 
@@ -15,7 +16,12 @@ from ...presentation.formatters.status import format_play_duration
 from ...presentation.renderers.game_start import render_game_start
 from ...presentation.renderers.game_end import render_game_end
 from ...presentation.renderers.owned_game import render_owned_game
+from ...presentation.renderers.presence_card import render_presence_card
 from ...presentation.renderers.owned_games_batch import render_owned_games_batch
+
+
+# 渲染出的通知临时图片保留时长（秒）：适配器读取时机无法在插件侧确认，延迟回收
+RENDERED_IMAGE_RETENTION_SECONDS = 600
 
 
 class NotificationTrackingMixin:
@@ -77,9 +83,16 @@ class NotificationTrackingMixin:
     async def _render_notification_image(self, noti):
         try:
             if noti["type"] in ("online", "offline"):
-                # 上线/下线为纯文本推送，不渲染图片
-                return None
-            if noti["type"] == "owned_batch":
+                # 上线/下线状态卡：头像 + 状态标题 + 时间/本次在线时长
+                img_bytes = await render_presence_card(
+                    self.data_dir, noti["sid"], noti["name"], noti["type"],
+                    avatar_url=noti.get("avatar_url"),
+                    online_minutes=noti.get("online_minutes"),
+                    event_time=noti.get("event_time"),
+                    font_path=resolve_font_path("NotoSansHans-Regular.otf"),
+                    proxy=self.proxy, version=self._plugin_version,
+                )
+            elif noti["type"] == "owned_batch":
                 # 简洁模式：本轮新增合并成清单图；不取卡片详情，封面命中缓存即零网络
                 img_bytes = await render_owned_games_batch(
                     self.data_dir, noti["sid"], noti["name"], noti.get("avatar_url"),
@@ -141,10 +154,35 @@ class NotificationTrackingMixin:
                 )
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                 tmp.write(img_bytes)
+                files = getattr(self, "_notification_image_files", None)
+                if files is None:
+                    files = self._notification_image_files = []
+                files.append((tmp.name, time.time()))
                 return tmp.name
         except Exception as e:
             logger.error(f"渲染通知图片失败 ({noti.get('type')}, {noti.get('name')}): {e}")
             return None
+
+    def _cleanup_expired_notification_images(self):
+        """延迟回收已渲染的通知临时图片。
+
+        无法确认各适配器会在 send_message 返回前读取本地图片，因此不在发送后
+        立即删除；只回收超过 RENDERED_IMAGE_RETENTION_SECONDS 的文件，避免误删。
+        """
+        files = getattr(self, "_notification_image_files", None)
+        if not files:
+            return
+        now = time.time()
+        kept = []
+        for path, created_at in files:
+            if now - created_at < RENDERED_IMAGE_RETENTION_SECONDS:
+                kept.append((path, created_at))
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._notification_image_files = kept
 
     @staticmethod
     def _is_intentionally_unrendered(notification):
@@ -208,6 +246,7 @@ class NotificationTrackingMixin:
             self._sent_notification_events[key] = time.time()
 
     async def _send_merged_notification(self, group_id, notifications):
+        self._cleanup_expired_notification_images()
         if not notifications:
             return []
         if in_quiet_hours(getattr(self, "config", {}) or {}):
@@ -229,7 +268,17 @@ class NotificationTrackingMixin:
 
         if not session_notifications:
             return []
+        # id(notification) -> 渲染任务：同一事件发往多群时共享同一次渲染，
+        # 避免并发 send_batches 各自 branch 先检查后 await 造成重复出图。
         images = {}
+
+        def _image_task(notification):
+            key = id(notification)
+            task = images.get(key)
+            if task is None:
+                task = images[key] = asyncio.create_task(self._render_notification_image(notification))
+            return task
+
         cooldowns = getattr(self, "_notification_cooldowns", None)
         if cooldowns is None:
             cooldowns = self._notification_cooldowns = {}
@@ -243,10 +292,9 @@ class NotificationTrackingMixin:
             included = []
             retry = []
             for notification in matched_notifications:
+                img_path = None
                 if self.config.get("notify_send_image", True):
-                    key = id(notification)
-                    if key not in images:
-                        images[key] = await self._render_notification_image(notification)
+                    img_path = await _image_task(notification)
                 before = len(msg_chain)
                 if notification["type"] == "start":
                     line = f"🟢【{notification['name']}】开始游玩 {notification['game']}\n"
@@ -275,14 +323,12 @@ class NotificationTrackingMixin:
                     line = f"👋 {notification['name']} 不玩 {notification['game']}，游玩时间 {notification['duration_str']}\n"
                 if self.config.get("notify_send_text", True):
                     msg_chain.append(Plain(line))
-                img_path = images.get(id(notification))
                 if img_path:
                     msg_chain.append(Image.fromFileSystem(img_path))
                 if len(msg_chain) > before:
                     included.append(notification)
                 elif (
                     self.config.get("notify_send_image", True)
-                    and notification["type"] not in ("online", "offline")
                     and not self._is_intentionally_unrendered(notification)
                 ):
                     retry.append(notification)
@@ -346,6 +392,10 @@ class NotificationTrackingMixin:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            for image_task in images.values():
+                if not image_task.done():
+                    image_task.cancel()
+            await asyncio.gather(*images.values(), return_exceptions=True)
         return [notification for result in results for notification in result]
 
     async def _flush_pending_end_notifications(self):

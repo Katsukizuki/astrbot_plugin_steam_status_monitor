@@ -72,8 +72,8 @@
 | `enable_game_end_notify` | 游戏结束通知开关 | true |
 | `enable_game_start_notify` | 游戏开始通知开关（关闭后仅记录时长） | true |
 | `enable_network_fluctuation_notify` | 网络波动通知开关（纯文本） | true |
-| `enable_user_online_notify` | 用户上线通知开关（纯文本；默认关闭；检测延迟约 3–30 分钟） | false |
-| `enable_user_offline_notify` | 用户下线通知开关（纯文本，附本次在线时长；默认关闭；180 秒防抖） | false |
+| `enable_user_online_notify` | 用户上线通知开关（文本+状态卡图片；默认关闭；检测延迟约 3–30 分钟） | false |
+| `enable_user_offline_notify` | 用户下线通知开关（文本+状态卡图片，附本次在线时长；默认关闭；180 秒防抖） | false |
 | `notify_send_image` | 通知发送图片开关 | true |
 | `notify_send_text` | 通知发送文本开关 | true |
 | `notify_quiet_hours` | 静默时段（免打扰），格式 `起始小时,结束小时`（整点 0–23）；`0,8` = 00:00–07:59，`23,8` = 23:00–次日 07:59，`0,0` 或两值相同 = 关闭；非法值按关闭处理。仅跳过播报，轮询与数据记录照常，命中即丢弃不补发 | `0,0` |
@@ -243,6 +243,9 @@ pip install "httpx[socks]" "Pillow>=9.5,<14"
 > 如果本项目对您的生活 / 工作产生了帮助，或者您关注本项目的未来发展，请给项目 Star，这是我维护这个开源项目的动力 ❤️。
 
 ## 更新记录
+- V4.13.2（2026/11/08）
+  - **上下线通知支持图片状态卡**：上线/下线通知不再只有文本，新增 512×192 状态卡（渐变底 + 头像/Steam 头像框 + 状态标题 + 在线开始/离线时间 + 离线时的「本次在线」时长 + 版本水印）。图片与文本分别受 `notify_send_image` / `notify_send_text` 控制，可图文同发或纯图/纯文本；无头像时用内置默认头像占位。渲染失败时纯文本模式自动降级，纯图片模式回队重试。
+
 - V4.13.1（2026/10/29）
   - **修复 AI 游戏库工具报错**：`steam_owned_games` 在 QQ 官方机器人会话中把事件对象当成插件实例，触发 `AttributeError: 'QQOfficialMessageEvent' object has no attribute 'owned_games'`。LLM 工具注册桩已移到入口 `main.py`，确保 AstrBot 按入口模块路径把处理器绑定到插件实例；同时兼容官方机器人链路额外传入的 `event` 关键字参数，不影响自定义协议。
 

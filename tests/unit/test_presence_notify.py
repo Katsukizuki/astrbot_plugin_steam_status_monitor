@@ -2,6 +2,8 @@
 
 import ast
 import asyncio
+import os
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -46,6 +48,11 @@ class _StubLogger:
         pass
 
 
+async def _fake_render_presence_card(*args, **kwargs):
+    """渲染器替身：返回最小 PNG 头，避免测试依赖字体/头像下载。"""
+    return b"\x89PNG\r\n\x1a\n"
+
+
 def _load_notification_methods(names):
     """AST 抽取 NotificationTrackingMixin 的指定方法（astrbot 不可导入，同 test_notification_deduplication）。"""
     tree = ast.parse(IMPLEMENTATION_PATH.read_text(encoding="utf-8"))
@@ -60,6 +67,7 @@ def _load_notification_methods(names):
     module = ast.Module(body=methods, type_ignores=[])
     namespace = {
         "asyncio": asyncio,
+        "os": os,
         "time": time,
         "logger": _StubLogger(),
         "Plain": _Plain,
@@ -71,6 +79,10 @@ def _load_notification_methods(names):
         "enqueue_notifications": enqueue_notifications,
         "trim_notifications": trim_notifications,
         "TTL_SECONDS": 1800,
+        "render_presence_card": _fake_render_presence_card,
+        "resolve_font_path": lambda _name: None,
+        "tempfile": tempfile,
+        "RENDERED_IMAGE_RETENTION_SECONDS": 600,
     }
     exec(compile(ast.fix_missing_locations(module), str(IMPLEMENTATION_PATH), "exec"), namespace)
     return namespace
@@ -83,6 +95,7 @@ SEND_METHODS = (
     "_notification_event_key",
     "_send_merged_notification",
     "_render_notification_image",
+    "_cleanup_expired_notification_images",
 )
 
 
@@ -98,6 +111,9 @@ def _build_send_plugin():
     plugin_type = type("SendFakePlugin", (), {name: methods[name] for name in SEND_METHODS})
     plugin = plugin_type()
     plugin.config = {"notify_send_text": True, "notify_send_image": False}
+    plugin.data_dir = ""
+    plugin.proxy = None
+    plugin._plugin_version = "test"
     plugin.notify_sessions = {"g1": "test:GroupMessage:123"}
     plugin.push_groups = {}
     plugin.group_monitor_enabled = {}
@@ -443,23 +459,69 @@ class PresenceSendTests(unittest.IsolatedAsyncioTestCase):
         second = self.plugin._notification_event_key({"type": "offline", "sid": "s1", "event_time": 2000}, "sess")
         self.assertNotEqual(first, second)
 
-    async def test_text_disabled_drops_presence_without_retry(self):
+    async def test_text_disabled_still_sends_presence_image(self):
+        # 上下线通知已支持图片：文本关闭、图片开启时以纯图片形式发送
         self.plugin.config.update({"notify_send_text": False, "notify_send_image": True})
         failed = await self.plugin._send_merged_notification(
             "g1",
             [{"type": "online", "sid": "s1", "name": "小明", "event_time": 1000, "online_minutes": None}],
         )
         self.assertEqual([], failed)
-        self.assertEqual([], self.plugin.sent)
+        self.assertEqual(1, len(self.plugin.sent))
+        _, chain = self.plugin.sent[0]
+        self.assertEqual(1, len(chain.chain))
+        kind, path = chain.chain[0]
+        self.assertEqual("image", kind)
+        os.unlink(path)
 
-    async def test_render_notification_image_skips_presence_types(self):
+    async def test_render_notification_image_renders_presence_card(self):
         methods = _load_notification_methods({"_render_notification_image"})
         plugin_type = type(
             "RenderFakePlugin", (), {"_render_notification_image": methods["_render_notification_image"]}
         )
         plugin = plugin_type()
-        self.assertIsNone(await plugin._render_notification_image({"type": "online"}))
-        self.assertIsNone(await plugin._render_notification_image({"type": "offline"}))
+        plugin.data_dir = ""
+        plugin.proxy = None
+        plugin._plugin_version = "test"
+        for kind, extra in (("online", {}), ("offline", {"online_minutes": 133.0})):
+            path = await plugin._render_notification_image(
+                {"type": kind, "sid": "s1", "name": "P", "event_time": 1000, **extra}
+            )
+            self.assertTrue(path)
+            with open(path, "rb") as f:
+                self.assertTrue(f.read().startswith(b"\x89PNG"))
+            os.unlink(path)
+
+    async def test_rendered_presence_image_registered_for_delayed_cleanup(self):
+        methods = _load_notification_methods({"_render_notification_image"})
+        plugin_type = type(
+            "RenderFakePlugin", (), {"_render_notification_image": methods["_render_notification_image"]}
+        )
+        plugin = plugin_type()
+        plugin.data_dir = ""
+        plugin.proxy = None
+        plugin._plugin_version = "test"
+        path = await plugin._render_notification_image(
+            {"type": "online", "sid": "s1", "name": "P", "event_time": 1000}
+        )
+        # 落盘的临时图进入延迟回收清单，由发送轮次按 TTL 清理
+        self.assertIn(path, [registered for registered, _ in plugin._notification_image_files])
+        os.unlink(path)
+
+    async def test_presence_image_failure_enters_retry_in_image_only_mode(self):
+        # 纯图片模式（文本关闭）下渲染失败必须回队重试，而不是当作"无内容"丢弃
+        plugin = _build_send_plugin()
+        plugin.config.update({"notify_send_text": False, "notify_send_image": True})
+
+        async def failed_render(_noti):
+            return None
+
+        plugin._render_notification_image = failed_render
+        failed = await plugin._send_merged_notification(
+            "g1", [{"type": "online", "sid": "s1", "name": "P", "event_time": 1000}]
+        )
+        self.assertEqual(1, len(failed))
+        self.assertEqual("online", failed[0]["type"])
 
 
 if __name__ == "__main__":
