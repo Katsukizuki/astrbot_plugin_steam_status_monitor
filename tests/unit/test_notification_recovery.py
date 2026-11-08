@@ -1,6 +1,8 @@
 """发送端持续故障后的批次结算与恢复。"""
 
 import asyncio
+import os
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
@@ -76,6 +78,40 @@ class NotificationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         failed = await p._send_merged_notification("g1", notifications(7))
         self.assertEqual(7, len(failed))
         self.assertTrue(all(n["_target_session"].endswith("456") for n in failed))
+
+    async def test_multi_target_renders_event_once(self):
+        # 同一事件发往主群 + 联动群：并发发送时只渲染一张图
+        p = plugin()
+        p.push_groups = {"sid": ["g2"]}
+        p.notify_sessions["g2"] = "test:GroupMessage:456"
+        p.config = {"notify_send_image": True, "notify_send_text": False}
+        rendered = []
+
+        async def render(n):
+            rendered.append(n["start_time"])
+            await asyncio.sleep(0)  # 放大并发窗口
+            return "image.png"
+
+        p._render_notification_image = render
+        failed = await p._send_merged_notification("g1", notifications(3))
+        self.assertEqual([], failed)
+        self.assertEqual([0, 1, 2], rendered)
+        self.assertEqual(2, len(p.sent))
+
+    async def test_expired_rendered_images_are_removed(self):
+        p = plugin()
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.path.join(tmp, "old.png")
+            fresh = os.path.join(tmp, "fresh.png")
+            for path in (old, fresh):
+                with open(path, "wb") as f:
+                    f.write(b"\x89PNG")
+            now = time.time()
+            p._notification_image_files = [(old, now - 601), (fresh, now - 10)]
+            p._cleanup_expired_notification_images()
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.exists(fresh))
+            self.assertEqual([fresh], [path for path, _ in p._notification_image_files])
 
     async def test_cancel_restores_all_groups_and_releases_inflight(self):
         p = plugin()

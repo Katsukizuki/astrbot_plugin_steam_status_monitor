@@ -142,14 +142,39 @@ _OWNED_INT_KEYS = {
     "owned_games_compact_cover_concurrency",
 }
 _TRUE_WORDS = {"1", "true", "on", "yes", "开启", "启用"}
+_FALSE_WORDS = {"0", "false", "off", "no", "关闭", "禁用"}
+# 用户上下线通知与图文总开关：布尔语义独立于 int（bool 是 int 子类），
+# 且老配置可能缺键，需要白名单放行 /steam set 热更新。
+_NOTIFICATION_BOOL_KEYS = {
+    "enable_user_online_notify",
+    "enable_user_offline_notify",
+    "notify_send_image",
+    "notify_send_text",
+}
+
+
+def _parse_bool_word(value):
+    """true/false 词表解析；无法识别返回 None。"""
+    text = str(value).strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+    return None
 
 
 def apply_hot_update(plugin, key, value):
     """/steam set 热更新：改 config 并同步已暴露的运行时属性。"""
-    if key not in plugin.config and key not in OWNED_GAMES_HOT_KEYS:
+    if key not in plugin.config and key not in OWNED_GAMES_HOT_KEYS and key not in _NOTIFICATION_BOOL_KEYS:
         return False, f"无效参数: {key}"
     old = plugin.config.get(key)
-    if key in OWNED_GAMES_HOT_KEYS:
+    if key in _NOTIFICATION_BOOL_KEYS:
+        # 上线/下线/图文开关：通知路径发送时现读 config，改后立即生效
+        parsed = _parse_bool_word(value)
+        if parsed is None:
+            return False, "类型错误，应为 true/false"
+        value = parsed
+    elif key in OWNED_GAMES_HOT_KEYS:
         # 游戏库新入库相关配置：老配置尚未合并新键时也允许热更新；
         # 服务每轮直接读取 plugin.config，改后无需重启即可生效。
         if key in _OWNED_BOOL_KEYS:
